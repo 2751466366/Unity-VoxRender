@@ -1,0 +1,57 @@
+# ============== Unity 生成的缓存与产物 ==============
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+
+# Unity 2019.3+ 自动生成的 Assembly-CSharp.csproj 等
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+*.VC.opendb
+
+# Rider / Visual Studio
+.vs/
+.idea/
+*.DS_Store
+
+# Unity 渲染管线的 Shader 编译缓存
+[Gg]raphics/[Ss]hader[Cc]ache/
+[Gg]raphics/[Ss]hader[Vv]ariants/
+
+# Unity AssetDatabase v2 的临时数据
+[Aa]ssets/AssetStoreTools*
+
+# MonoDevelop / Visual Studio for Mac
+*.pidb
+*.userprefs
+
+# OS
+Thumbs.db
+.DS_Store
+*.swp
+*.swo
+
+# Crashlytics / Unity 崩溃日志
+sysinfo.txt
+*.stackdump
+
+# Packages
+# 如果有非 PackageManager 的本地 Packages 可以按需取消注释
+# Packages/

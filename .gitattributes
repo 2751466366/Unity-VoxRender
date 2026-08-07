@@ -1,0 +1,2 @@
+Assets/Scenes/Vox/*.vox filter=lfs diff=lfs merge=lfs -text
+Assets/Scenes/Vox/*.vox !text !filter !merge !diff
