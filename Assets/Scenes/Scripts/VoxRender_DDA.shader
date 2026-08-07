@@ -6,7 +6,8 @@ Shader "Unlit/VoxRender_DDA"
         _ChunkSize    ("Chunk Size (x,y,z)", Vector) = (1,1,1,0)
         _VoxelScale   ("Voxel Scale", Float) = 1.0
         _MaxSteps     ("Max Ray Steps", Int) = 256
-        _Ambient      ("Ambient Light", Range(0,1)) = 0.3
+        _Ambient      ("Ambient Light", Range(0,1)) = 0.1
+        _ShadowFactor ("Shadow Darkness", Range(0,1)) = 0.7
     }
     SubShader
     {
@@ -39,6 +40,7 @@ Shader "Unlit/VoxRender_DDA"
             float     _VoxelScale;
             int       _MaxSteps;
             float     _Ambient;
+            float     _ShadowFactor;
 
             v2f vert (appdata v)
             {
@@ -75,6 +77,85 @@ Shader "Unlit/VoxRender_DDA"
                     enterNormal = float3(0, 0, -sign(dir.z));
 
                 return tExit >= tEnter && tExit >= 0.0;
+            }
+
+            // 自阴影 DDA：从命中体素沿光方向步进，检测是否被其他体素遮挡
+            // 返回阴影系数（1.0 = 无阴影，越小越暗），同时按命中距离修正幅度：步进越小越暗
+            float computeShadow(float3 hitVoxel, float3 gridLightDir, float3 chunkDim)
+            {
+                // 和主 DDA 一致：从命中体素开始，用 hitVoxel 计算初始边界
+                // 第一次步进后 shadowVoxel 自动变成 hitVoxel + shadowStepDir（相邻体素）
+                float3 shadowStepDir = sign(gridLightDir);
+                float3 shadowVoxel   = hitVoxel;
+
+                float3 shadowAbsDir  = max(abs(gridLightDir), 1e-6);
+                float3 shadowTDelta  = 1.0 / shadowAbsDir;
+
+                // 精确起点：命中体素中心沿光方向微小偏移
+                float3 shadowGridOrigin = (hitVoxel + 0.5) + gridLightDir * 0.001;
+
+                float3 shadowNextBoundary = shadowStepDir > 0 ? hitVoxel + 1.0 : hitVoxel;
+                float3 shadowTMax = (shadowNextBoundary - shadowGridOrigin) / gridLightDir;
+                if (abs(gridLightDir.x) < 1e-6) shadowTMax.x = 1e10;
+                if (abs(gridLightDir.y) < 1e-6) shadowTMax.y = 1e10;
+                if (abs(gridLightDir.z) < 1e-6) shadowTMax.z = 1e10;
+
+                int  hitStep  = -1;     // 命中遮挡物时的步进次数，-1 表示未命中
+
+                [loop]
+                for (int ss = 0; ss < _MaxSteps; ss++)
+                {
+                    // 先步进：跨越一个体素边界，shadowVoxel 变为相邻体素
+                    if (shadowTMax.x < shadowTMax.y)
+                    {
+                        if (shadowTMax.x < shadowTMax.z)
+                        {
+                            shadowVoxel.x += shadowStepDir.x;
+                            shadowTMax.x  += shadowTDelta.x;
+                        }
+                        else
+                        {
+                            shadowVoxel.z += shadowStepDir.z;
+                            shadowTMax.z  += shadowTDelta.z;
+                        }
+                    }
+                    else
+                    {
+                        if (shadowTMax.y < shadowTMax.z)
+                        {
+                            shadowVoxel.y += shadowStepDir.y;
+                            shadowTMax.y  += shadowTDelta.y;
+                        }
+                        else
+                        {
+                            shadowVoxel.z += shadowStepDir.z;
+                            shadowTMax.z  += shadowTDelta.z;
+                        }
+                    }
+
+                    // 步进后再检查边界
+                    if (any(shadowVoxel < 0) || any(shadowVoxel >= chunkDim))
+                        break;
+
+                    // 再采样：此时 shadowVoxel 已经是相邻体素
+                    float3 shadowUVW = (shadowVoxel + 0.5) / chunkDim;
+                    fixed4 shadowCol = tex3D(_VoxelTexture, shadowUVW);
+
+                    if (shadowCol.a > 0.01)
+                    {
+                        hitStep = ss;
+                        break;
+                    }
+                }
+
+                if (hitStep < 0)
+                    return 1.0; // 未被遮挡
+
+                // 步进越小 → 遮挡越近 → 阴影越暗
+                // 用 chunk 对角线方向的最大步进数做归一化
+                float maxDist = chunkDim.x + chunkDim.y + chunkDim.z;
+                float t = saturate((float)hitStep / maxDist);
+                return lerp(_ShadowFactor, 0, t);
             }
 
             fixed4 frag (v2f i) : SV_Target
@@ -156,6 +237,13 @@ Shader "Unlit/VoxRender_DDA"
                         float3 diffuse = voxelColor.rgb * _LightColor0.rgb * ndotl;
                         // 环境光
                         float3 ambient = voxelColor.rgb * _Ambient;
+
+                        // ===== 自阴影 DDA =====
+                        // 世界空间光方向 → 本地空间 → 网格空间（y/z 交换）
+                        float3 shadowLocalDir = normalize(mul((float3x3)unity_WorldToObject, lightDir));
+                        float3 shadowGridDir  = normalize(float3(shadowLocalDir.x, shadowLocalDir.z, shadowLocalDir.y));
+                        // 阴影只影响漫反射（环境光不受阴影影响）
+                        diffuse *= computeShadow(currentVoxel, shadowGridDir, chunkDim);
                         // 合成最终颜色
                         return fixed4(diffuse + ambient, voxelColor.a);
                     }
