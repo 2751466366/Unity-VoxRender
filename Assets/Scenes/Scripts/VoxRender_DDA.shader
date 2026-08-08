@@ -179,7 +179,8 @@ Shader "Unlit/VoxRender_DDA"
                 float3 gridOrigin = toGridSpace(entryPoint);
                 gridOrigin = clamp(gridOrigin, float3(0,0,0), chunkDim - 0.001);
 
-                float3 gridDir = normalize(float3(rayDir.x, rayDir.z, rayDir.y));
+                // 网格方向：本地 Y/Z 交换 × chunkDim 缩放（不归一化，避免非立方体块扭曲）
+                float3 gridDir = float3(rayDir.x, rayDir.z, rayDir.y) * _ChunkSize.xyz;
 
                 float3 currentVoxel = floor(gridOrigin);
                 float3 stepDir      = sign(gridDir);
@@ -238,10 +239,9 @@ Shader "Unlit/VoxRender_DDA"
                         // 环境光
                         float3 ambient = voxelColor.rgb * _Ambient;
 
-                        // ===== 自阴影 DDA =====
-                        // 世界空间光方向 → 本地空间 → 网格空间（y/z 交换）
-                        float3 shadowLocalDir = normalize(mul((float3x3)unity_WorldToObject, lightDir));
-                        float3 shadowGridDir  = normalize(float3(shadowLocalDir.x, shadowLocalDir.z, shadowLocalDir.y));
+                        // ===== 自阴影 DDA（同样不归一化，乘 chunkDim）=====
+                        float3 shadowLocalDir = mul((float3x3)unity_WorldToObject, lightDir);
+                        float3 shadowGridDir  = float3(shadowLocalDir.x, shadowLocalDir.z, shadowLocalDir.y) * _ChunkSize.xyz;
                         // 阴影只影响漫反射（环境光不受阴影影响）
                         diffuse *= computeShadow(currentVoxel, shadowGridDir, chunkDim);
                         // 合成最终颜色

@@ -16,6 +16,10 @@ public class VoxLoader : MonoBehaviour
     [Tooltip("Material used for chunk proxy cubes. Must sample _VoxelTexture (Texture3D) and _ChunkSize (Vector3).")]
     public Material chunk3DMaterial;
 
+    [Header("Runtime Data")]
+    [Tooltip("所有已创建的 chunk 代理立方体（按 model 顺序），外部脚本可读取")]
+    public List<GameObject> chunkCubes = new List<GameObject>();
+
     [Header("Load On Start")]
     [Tooltip("Automatically load the vox file on Start()")]
     public bool loadOnStart = true;
@@ -187,6 +191,8 @@ public class VoxLoader : MonoBehaviour
             }
         }
 
+        chunkCubes.Clear();
+
         for (int modelIdx = 0; modelIdx < voxFile.Models.Length; modelIdx++)
         {
             var model = voxFile.Models[modelIdx];
@@ -232,6 +238,7 @@ public class VoxLoader : MonoBehaviour
             GameObject chunkCube = GameObject.CreatePrimitive(PrimitiveType.Cube);
             chunkCube.name = $"Chunk_{model.Name}_m{model.Id}_{sx}x{sy}x{sz}";
             chunkCube.transform.SetParent(transform, false);
+            chunkCubes.Add(chunkCube);
 
             if (!Application.isPlaying)
             {
@@ -274,6 +281,8 @@ public class VoxLoader : MonoBehaviour
     [ContextMenu("Clear Voxels")]
     public void ClearExistingVoxels()
     {
+        chunkCubes.Clear();
+
         for (int i = transform.childCount - 1; i >= 0; i--)
         {
             GameObject child = transform.GetChild(i).gameObject;
