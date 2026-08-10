@@ -5,7 +5,7 @@ using UnityEngine;
 /// 加载时传入路径和父节点，卸载时转发给 provider。
 /// 所有资源（立方体/纹理/材质）的创建与销毁由 VoxDataProvider/VoxAsset 统一管理。
 /// </summary>
-[ExecuteInEditMode]
+// [ExecuteInEditMode]
 public class VoxModel : MonoBehaviour
 {
     [Header("Vox File Settings")]

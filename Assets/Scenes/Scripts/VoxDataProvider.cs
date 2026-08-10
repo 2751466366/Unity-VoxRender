@@ -151,14 +151,14 @@ public class VoxDataProvider : MonoBehaviour
     {
         if (baseMat == null)
         {
-            Shader sh = Shader.Find("Unlit/VoxRender_DDA_W");
+            Shader sh = Shader.Find("Unlit/VoxRender_GBuffer");
             if (sh == null)
             {
-                Debug.LogError("[VoxDataProvider] 未找到 Unlit/VoxRender_DDA shader，无法创建 chunk");
+                Debug.LogError("[VoxDataProvider] 未找到 Unlit/VoxRender_GBuffer shader，无法创建 chunk");
                 return false;
             }
             baseMat = new Material(sh);
-            baseMat.name = "VoxDDA_Default";
+            baseMat.name = "VoxGBuffer_Default";
         }
 
         for (int i = 0; i < voxFile.Models.Length; i++)
