@@ -24,17 +24,28 @@ public class DeferredPipeline : MonoBehaviour
     [Tooltip("在 Game 视图中显示 G-Buffer 各通道而非最终光照结果")]
     public DebugView debugView = DebugView.Final;
 
+    [Tooltip("SVO 射线遍历计算着色器（拖入 SVO_RayCast.compute）")]
+    public ComputeShader svoRayCast;
+
     public enum DebugView
     {
         Final,
         Albedo,
         Normal,
         WorldPos,
+        SVOVisual,
     }
 
     private Camera cam;
     private CommandBuffer gBufferCmd;
     private Material lightingMat;
+    private Material blendMat;  // SVO 混合材质
+
+    // SVO 构建状态
+    private bool svoBuilt = false;
+
+    // SVO 可视化 RT（OnPreRender 中渲染，OnRenderImage 中 Blit）
+    private RenderTexture svoVisRT;
 
     // G-Buffer RenderTextures
     private RenderTexture gBufferAlbedo;    // RT0: RGBA32，深度 24-bit
@@ -50,6 +61,7 @@ public class DeferredPipeline : MonoBehaviour
     private static readonly int LightColorID  = Shader.PropertyToID("_LightColor");
     private static readonly int SkyboxTexID   = Shader.PropertyToID("_SkyboxTex");
     private static readonly int InverseVPID   = Shader.PropertyToID("_InverseVP");
+    private static readonly int SVOResultID   = Shader.PropertyToID("_SVOResult");
 
     void OnEnable()
     {
@@ -70,6 +82,14 @@ public class DeferredPipeline : MonoBehaviour
         lightingMat = new Material(lightingShader);
         lightingMat.name = "DeferredLighting";
 
+        // 创建 SVO 混合材质
+        Shader blendShader = Shader.Find("Hidden/SVOBlend");
+        if (blendShader != null)
+        {
+            blendMat = new Material(blendShader);
+            blendMat.name = "SVOBlend";
+        }
+
         // 创建 CommandBuffer（先移除旧的，防止重编译后重复添加）
         if (gBufferCmd != null)
             cam.RemoveCommandBuffer(CameraEvent.BeforeImageEffects, gBufferCmd);
@@ -84,6 +104,16 @@ public class DeferredPipeline : MonoBehaviour
             cam.RemoveCommandBuffer(CameraEvent.BeforeImageEffects, gBufferCmd);
 
         ReleaseRTs();
+        SVOBuilder.Release();
+        svoBuilt = false;
+
+        if (svoVisRT != null)
+        {
+            svoVisRT.Release();
+            if (Application.isPlaying) Destroy(svoVisRT);
+            else DestroyImmediate(svoVisRT);
+            svoVisRT = null;
+        }
 
         if (lightingMat != null)
         {
@@ -91,12 +121,44 @@ public class DeferredPipeline : MonoBehaviour
             else DestroyImmediate(lightingMat);
             lightingMat = null;
         }
+
+        if (blendMat != null)
+        {
+            if (Application.isPlaying) Destroy(blendMat);
+            else DestroyImmediate(blendMat);
+            blendMat = null;
+        }
     }
 
     void OnPreRender()
     {
         EnsureRTs();
+        TryBuildSVO();
         RebuildCommandBuffer();
+
+        // SVO 可视化：在 OnPreRender 中 dispatch 计算着色器，避免在 OnRenderImage 中 dispatch 导致管线状态损坏
+        if (debugView == DebugView.SVOVisual && svoBuilt)
+            DispatchSVORayCastPre();
+    }
+
+    /// <summary>检查是否需要构建 SVO：VoxDataProvider 有已加载资产且尚未构建。</summary>
+    void TryBuildSVO()
+    {
+        if (svoBuilt) return;
+        var provider = VoxDataProvider.Instance;
+        if (provider == null) return;
+        if (provider.voxelElements.Count == 0) return;
+
+        float scale = 1f;
+        // 使用第一个 VoxModel 的 scale（场景中可能有多个，取首个有效值）
+        var models = FindObjectsOfType<VoxModel>();
+        foreach (var m in models)
+        {
+            if (m.Handle >= 0) { scale = m.voxelScale; break; }
+        }
+
+        SVOBuilder.Build(provider.Assets, scale);
+        svoBuilt = true;
     }
 
     /// <summary>确保 G-Buffer RT 与屏幕分辨率一致，变化时重建。</summary>
@@ -168,10 +230,11 @@ public class DeferredPipeline : MonoBehaviour
         foreach (var asset in provider.Assets)
         {
             if (asset == null || !asset.isActive) continue;
-            for (int i = 0; i < asset.chunkCubes.Count; i++)
+            for (int i = 0; i < asset.chunks.Count; i++)
             {
-                var cube = asset.chunkCubes[i];
-                var mat  = asset.materials[i];
+                var chunk = asset.chunks[i];
+                var cube = chunk != null ? chunk.cube : null;
+                var mat  = i < asset.materials.Count ? asset.materials[i] : null;
                 if (cube == null || mat == null) continue;
 
                 var mf = cube.GetComponent<MeshFilter>();
@@ -229,6 +292,44 @@ public class DeferredPipeline : MonoBehaviour
             case DebugView.WorldPos:
                 Graphics.Blit(gBufferWorldPos, dest);
                 break;
+            case DebugView.SVOVisual:
+                if (svoVisRT != null && blendMat != null)
+                {
+                    // 1:1 混合：先渲染默认光照到临时 RT，再与 SVO 可视化混合
+                    RenderTexture lightingRT = RenderTexture.GetTemporary(src.width, src.height, 0, src.format);
+                    
+                    // 渲染默认光照
+                    SetLightParameters();
+                    lightingMat.SetTexture(AlbedoTexID, gBufferAlbedo);
+                    lightingMat.SetTexture(NormalTexID, gBufferNormal);
+                    lightingMat.SetTexture(WorldPosTexID, gBufferWorldPos);
+
+                    Cubemap sky2 = null;
+                    var skybox2 = cam.GetComponent<Skybox>();
+                    if (skybox2 != null && skybox2.material != null && skybox2.material.HasProperty("_Tex"))
+                        sky2 = skybox2.material.GetTexture("_Tex") as Cubemap;
+                    if (sky2 == null && RenderSettings.skybox != null && RenderSettings.skybox.HasProperty("_Tex"))
+                        sky2 = RenderSettings.skybox.GetTexture("_Tex") as Cubemap;
+                    if (sky2 != null)
+                        lightingMat.SetTexture(SkyboxTexID, sky2);
+
+                    Matrix4x4 vp2 = GL.GetGPUProjectionMatrix(cam.projectionMatrix, false) * cam.worldToCameraMatrix;
+                    lightingMat.SetMatrix(InverseVPID, vp2.inverse);
+
+                    Graphics.Blit(null, lightingRT, lightingMat);
+                    
+                    // 混合 SVO 和光照
+                    blendMat.SetTexture("_MainTex", svoVisRT);
+                    blendMat.SetTexture("_LightingTex", lightingRT);
+                    Graphics.Blit(null, dest, blendMat);
+                    
+                    RenderTexture.ReleaseTemporary(lightingRT);
+                }
+                else if (svoVisRT != null)
+                    Graphics.Blit(svoVisRT, dest);
+                else
+                    Graphics.Blit(src, dest);
+                break;
             default:
                 // ===== Pass 3: 光照合成 =====
                 SetLightParameters();
@@ -255,4 +356,62 @@ public class DeferredPipeline : MonoBehaviour
                 break;
         }
     }
+
+    /// <summary>在 OnPreRender 中调度 SVO 射线遍历计算着色器，渲染到 svoVisRT。</summary>
+    void DispatchSVORayCastPre()
+    {
+        if (svoRayCast == null || cam == null) return;
+
+        int w = cam.pixelWidth;
+        int h = cam.pixelHeight;
+        if (w <= 0 || h <= 0) return;
+
+        int kernel = svoRayCast.FindKernel("CSMain");
+        if (kernel < 0)
+        {
+            Debug.LogError("[SVOVis] 计算着色器找不到 CSMain kernel");
+            return;
+        }
+
+        // 创建或重建 RT
+        if (svoVisRT == null || svoVisRT.width != w || svoVisRT.height != h)
+        {
+            if (svoVisRT != null) { svoVisRT.Release(); Destroy(svoVisRT); }
+            svoVisRT = new RenderTexture(w, h, 0, RenderTextureFormat.ARGBFloat);
+            svoVisRT.enableRandomWrite = true;
+            svoVisRT.name = "SVOVis_RT";
+            svoVisRT.Create();
+        }
+
+        try
+        {
+            Matrix4x4 vp = GL.GetGPUProjectionMatrix(cam.projectionMatrix, false) * cam.worldToCameraMatrix;
+            svoRayCast.SetMatrix("_InverseVP", vp.inverse);
+            svoRayCast.SetVector("_CameraPos", cam.transform.position);
+            svoRayCast.SetTexture(kernel, "_SVOResult", svoVisRT);
+
+            uint tgX, tgY, tgZ;
+            svoRayCast.GetKernelThreadGroupSizes(kernel, out tgX, out tgY, out tgZ);
+            svoRayCast.Dispatch(kernel, Mathf.CeilToInt(w / (float)tgX), Mathf.CeilToInt(h / (float)tgY), 1);
+
+            // 诊断日志（只打印一次）
+            if (!_svoVisLogged)
+            {
+                _svoVisLogged = true;
+                // 读取全局 SVO 参数
+                var rootMin = Shader.GetGlobalVector("_SVORootMin");
+                var scale = Shader.GetGlobalFloat("_SVOScale");
+                var depth = Shader.GetGlobalInt("_SVODepth");
+                Debug.Log($"[SVOVis] 诊断: _SVORootMin={rootMin}, _SVOScale={scale}, _SVODepth={depth}");
+                Debug.Log($"[SVOVis] 相机: pos={cam.transform.position}, forward={cam.transform.forward}");
+                Debug.Log($"[SVOVis] RT: {w}x{h}, kernel={kernel}, threadGroup=({tgX},{tgY},{tgZ})");
+            }
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogError($"[SVOVis] 计算着色器调度失败: {ex.Message}");
+        }
+    }
+
+    private bool _svoVisLogged = false;
 }

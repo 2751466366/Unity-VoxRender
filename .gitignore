@@ -28,6 +28,7 @@
 
 # Rider / Visual Studio
 .vs/
+.qoder/
 .idea/
 *.DS_Store
 

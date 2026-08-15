@@ -19,6 +19,8 @@ public class VoxDataProviderEditor : Editor
         EditorGUI.BeginDisabledGroup(true);
 
         EditorGUILayout.IntField("资产总数", provider.Count);
+        EditorGUILayout.IntField("全局 VoxelElements", provider.voxelElements.Count);
+        EditorGUILayout.IntField("全局 MaterialElements", provider.materialElements.Count);
 
         for (int i = 0; i < assets.Count; i++)
         {
@@ -29,10 +31,9 @@ public class VoxDataProviderEditor : Editor
             EditorGUILayout.LabelField(label);
 
             EditorGUI.indentLevel++;
-            EditorGUILayout.IntField("Chunk Cubes", a.chunkCubes.Count);
+            EditorGUILayout.IntField("Chunks", a.chunks.Count);
             EditorGUILayout.IntField("Textures", a.textures.Count);
             EditorGUILayout.IntField("Materials", a.materials.Count);
-            EditorGUILayout.IntField("Chunk Dims", a.chunkDims.Count);
             EditorGUI.indentLevel--;
         }
 

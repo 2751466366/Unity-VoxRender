@@ -199,7 +199,7 @@ Shader "Unlit/VoxRender_GBuffer"
                     if (any(currentVoxel < 0) || any(currentVoxel >= chunkDim))
                         break;
 
-                    float3 sampleUVW = (currentVoxel + 0.5) / chunkDim;
+                    float3 sampleUVW = (currentVoxel + 0.5) / chunkDim;  // 采样体素中心
                     fixed4 voxelColor = tex3D(_VoxelTexture, sampleUVW);
 
                     if (voxelColor.a > 0.01)

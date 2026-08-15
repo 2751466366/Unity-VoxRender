@@ -1,0 +1,235 @@
+#pragma kernel CSMain
+
+// ============================================================
+//  SVO 射线遍历计算着色器
+//  每个像素沿相机射线方向遍历 SVO，命中体素返回材质颜色，未命中返回蓝色。
+//  用于验证 SVO 构建正确性。
+// ============================================================
+
+// ---- SVO 数据（由 SVOBuilder 上传） ----
+StructuredBuffer<uint4> _SVONodes;       // childMask, data, flags, _pad
+StructuredBuffer<float4> _SVOMaterials;  // 每 3 个 float4 一项 (48B): type/weight/rough/spec, ior/att/flux/pad, color
+
+float3 _SVORootMin;   // 根节点最小角（世界空间）
+float  _SVOScale;     // 体素缩放
+int    _SVODepth;     // 八叉树深度
+
+// ---- 相机参数 ----
+float4x4 _InverseVP;  // 逆 ViewProjection 矩阵（裁剪空间 → 世界空间）
+float3 _CameraPos;    // 相机世界坐标（显式传递，不能从 InverseVP 推导）
+
+// ---- 输出 ----
+RWTexture2D<float4> _SVOResult;
+
+// ---- 常量 ----
+static const float EPSILON = 1e-4f;
+static const float LARGE_T = 1e30f;
+
+// ============================================================
+//  射线-AABB 相交（slab method）
+//  boxMin=0, boxMax=side; 返回 tEnter/tExit，无交返回 false
+// ============================================================
+bool RayBoxIntersect(float3 ro, float3 rdInv, float side, out float tEnter, out float tExit)
+{
+    float3 t0 = -ro * rdInv;            // (0 - ro) * rdInv
+    float3 t1 = (side - ro) * rdInv;    // (side - ro) * rdInv
+    float3 tMin = min(t0, t1);
+    float3 tMax = max(t0, t1);
+    tEnter = max(max(tMin.x, tMin.y), tMin.z);
+    tExit  = min(min(tMax.x, tMax.y), tMax.z);
+    return tEnter <= tExit && tExit > 0.0;
+}
+
+// ============================================================
+//  SVO 栈式遍历（修复版：跟踪节点边界框）
+//  ro/rd 为网格空间（根 AABB = [0, rootSide]）
+//  返回命中的 materialIndex，未命中返回 -1
+// ============================================================
+int TraverseSVO(float3 ro, float3 rd)
+{
+    float rootSide = exp2((float)_SVODepth);
+
+    // 处理射线分量接近零的情况，防止除零
+    float3 rdInv = float3(
+        abs(rd.x) > EPSILON ? 1.0 / rd.x : 1e6 * sign(rd.x + EPSILON),
+        abs(rd.y) > EPSILON ? 1.0 / rd.y : 1e6 * sign(rd.y + EPSILON),
+        abs(rd.z) > EPSILON ? 1.0 / rd.z : 1e6 * sign(rd.z + EPSILON)
+    );
+
+    // 与根 AABB 相交
+    float tRootEnter, tRootExit;
+    if (!RayBoxIntersect(ro, rdInv, rootSide, tRootEnter, tRootExit))
+        return -1;
+    tRootEnter = max(tRootEnter, 0.0);
+
+    // ---- 栈式遍历 ----
+    // 栈深度 = 7 * depth（每层最多 7 个未处理兄弟节点）
+    uint   stackNode[64];
+    float3 stackNodeMin[64];
+    float  stackNodeSide[64];
+    float  stackTEnter[64];
+    float  stackTExit[64];
+    int sp = 0;
+
+    // 压入根节点
+    stackNode[sp]  = 0;
+    stackNodeMin[sp] = float3(0.0, 0.0, 0.0);
+    stackNodeSide[sp] = rootSide;
+    stackTEnter[sp] = tRootEnter;
+    stackTExit[sp]  = tRootExit;
+    sp++;
+
+    while (sp > 0)
+    {
+        sp--;
+        uint   nodeIdx   = stackNode[sp];
+        float3 nodeMin   = stackNodeMin[sp];
+        float  nodeSide  = stackNodeSide[sp];
+        float  tEnter    = stackTEnter[sp];
+        float  tExit     = stackTExit[sp];
+
+        uint4 node = _SVONodes[nodeIdx];
+        uint childMask = node.x;
+        uint data      = node.y;
+        uint flags     = node.z;
+
+        // ---- 叶子节点（flags bit8 设置） ----
+        if ((flags & 256u) != 0u)  // LEAF_FLAG = 1 << 8 = 256
+        {
+            // data = materialIndex，直接返回
+            return (int)data;
+        }
+
+        // ---- 内部节点：按射线进入顺序测试 8 个子节点 ----
+        uint childrenOffset = data;
+        float childSide = nodeSide * 0.5;  // 子节点边长 = 父节点的一半
+
+        // 按进入距离排序的子节点列表（最多 8 个）
+        uint  orderIdx[8];
+        float orderTE[8];
+        int orderCount = 0;
+
+        for (int c = 0; c < 8; c++)
+        {
+            if ((childMask & (1u << c)) == 0) continue;
+
+            // 计算子节点的最小角
+            float cx = (c & 1) != 0 ? childSide : 0.0;
+            float cy = (c & 2) != 0 ? childSide : 0.0;
+            float cz = (c & 4) != 0 ? childSide : 0.0;
+
+            float3 childMin = nodeMin + float3(cx, cy, cz);
+            float3 childMax = childMin + childSide;
+
+            // 子节点 AABB 相交
+            float3 t0c = (childMin - ro) * rdInv;
+            float3 t1c = (childMax - ro) * rdInv;
+            float3 tMinc = min(t0c, t1c);
+            float3 tMaxc = max(t0c, t1c);
+            float te = max(max(tMinc.x, tMinc.y), tMinc.z);
+            float tx = min(min(tMaxc.x, tMaxc.y), tMaxc.z);
+
+            if (te <= tx && tx > tEnter && te < tExit)
+            {
+                orderIdx[orderCount] = (uint)c;
+                orderTE[orderCount]  = max(te, tEnter);
+                orderCount++;
+            }
+        }
+
+        // 简单插入排序：按 te 升序（最远在前，最近在后）
+        // 入栈后 LIFO → 栈顶 = 最近子节点 = 先弹出先处理
+        for (int a = 0; a < orderCount - 1; a++)
+        {
+            for (int b = a + 1; b < orderCount; b++)
+            {
+                if (orderTE[b] < orderTE[a])
+                {
+                    // swap
+                    float tmpT = orderTE[a]; orderTE[a] = orderTE[b]; orderTE[b] = tmpT;
+                    uint  tmpI = orderIdx[a]; orderIdx[a] = orderIdx[b]; orderIdx[b] = tmpI;
+                }
+            }
+        }
+
+        // 压栈（升序 → 最远先压入栈底，最近最后压入栈顶 → 先弹出）
+        for (int k = 0; k < orderCount; k++)
+        {
+            if (sp >= 63) break; // 防止栈溢出
+            int c = (int)orderIdx[k];
+            int childSlot = (int)childrenOffset + c;
+            
+            // 计算子节点的最小角
+            float cx = (c & 1) != 0 ? childSide : 0.0;
+            float cy = (c & 2) != 0 ? childSide : 0.0;
+            float cz = (c & 4) != 0 ? childSide : 0.0;
+            float3 childMin = nodeMin + float3(cx, cy, cz);
+            
+            stackNode[sp]  = (uint)childSlot;
+            stackNodeMin[sp] = childMin;
+            stackNodeSide[sp] = childSide;
+            stackTEnter[sp] = orderTE[k];
+            stackTExit[sp]  = tExit;
+            sp++;
+        }
+    }
+
+    return -1; // 未命中任何叶子
+}
+
+// ============================================================
+//  CSMain
+// ============================================================
+[numthreads(8, 8, 1)]
+void CSMain(uint3 dtid : SV_DispatchThreadID)
+{
+    uint2 pixel = dtid.xy;
+    uint2 dims;
+    _SVOResult.GetDimensions(dims.x, dims.y);
+    if (pixel.x >= dims.x || pixel.y >= dims.y) return;
+
+    // ---- 构建相机射线 ----
+    float2 uv = (float2(pixel) + 0.5) / float2(dims);
+    float4 clipPos = float4(uv * 2.0 - 1.0, 1.0, 1.0);
+    float4 farWorldPos = mul(_InverseVP, clipPos);
+    farWorldPos /= farWorldPos.w;
+
+    float3 rd = normalize(farWorldPos.xyz - _CameraPos);
+    float3 ro = _CameraPos;
+
+    // ---- 世界空间 → 网格空间 ----
+    // 减 0.5 偏移：使 SVO 与 DDA 渲染对齐
+    float3 roGrid = (ro - _SVORootMin) / _SVOScale - float3(0.5, 0.5, 0.5);
+    //float3 rdGrid = rd / _SVOScale;
+    float3 rdGrid = normalize(rd); 
+
+    // ---- SVO 遍历 ----
+    int matIndex = TraverseSVO(roGrid, rdGrid);
+
+    float3 color;
+    if (matIndex >= 0)
+    {
+        // 诊断模式：输出固定红色，验证 SVO 结构是否正确
+        color = float3(0.2, 1.0, 0.2);
+        
+        /* 正常模式：读取材质颜色
+        int matIdx = matIndex * 3 + 2;
+        if (matIdx < _SVOMaterials.Length)
+        {
+            float4 colorData = _SVOMaterials[matIdx];
+            color = colorData.rgb;
+            color = pow(max(color, 0.0), 1.0 / 2.2);
+        }
+        else
+        {
+            color = float3(1.0, 0.0, 1.0); // 紫色 = 材质索引越界
+        }
+        */
+    }
+    else
+    {
+        color = float3(0.15, 0.25, 0.85); // 蓝色 = 未命中
+    }
+
+    _SVOResult[pixel] = float4(color, 1.0);
+}

@@ -388,7 +388,8 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   ambient: 0.2
-  debugView: 0
+  debugView: 4
+  svoRayCast: {fileID: 7200000, guid: b0dcbd8cf0fe0274f9c3331883e5307f, type: 3}
 --- !u!1 &1171443738
 GameObject:
   m_ObjectHideFlags: 0
@@ -486,16 +487,18 @@ MonoBehaviour:
   defaultChunkMaterial: {fileID: 0}
   assets:
   - filePath: Assets/Scenes/Vox/castle-all.vox
+    voxelElements: []
+    materialElements: []
+    chunks: []
     textures: []
-    chunkCubes: []
     materials: []
-    chunkDims: []
     isActive: 0
   - filePath: Assets/Scenes/Vox/castle.vox
+    voxelElements: []
+    materialElements: []
+    chunks: []
     textures: []
-    chunkCubes: []
     materials: []
-    chunkDims: []
     isActive: 0
 --- !u!1660057539 &9223372036854775807
 SceneRoots:

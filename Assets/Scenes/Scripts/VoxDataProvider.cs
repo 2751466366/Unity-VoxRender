@@ -27,6 +27,10 @@ public class VoxDataProvider : MonoBehaviour
     /// <summary>只读访问资产列表。外部代码不应修改此列表。</summary>
     public IReadOnlyList<VoxAsset> Assets => assets;
 
+    // SVO 输入：全局扁平数据（所有模型的集合）
+    [System.NonSerialized] public List<VoxelElement>    voxelElements    = new List<VoxelElement>();
+    [System.NonSerialized] public List<MaterialElement> materialElements = new List<MaterialElement>();
+
     void Awake()
     {
         if (Instance != null && Instance != this)
@@ -102,7 +106,7 @@ public class VoxDataProvider : MonoBehaviour
         {
             assets[handle] = asset;
         }
-        Debug.Log($"[VoxDataProvider] 已加载 '{voxFilePath}'，句柄={handle}，chunk 数={asset.chunkCubes.Count}");
+        Debug.Log($"[VoxDataProvider] 已加载 '{voxFilePath}'，句柄={handle}，chunk 数={asset.chunks.Count}，体素={voxelElements.Count}，材质={materialElements.Count}");
         return handle;
     }
 
@@ -117,9 +121,10 @@ public class VoxDataProvider : MonoBehaviour
 
     public IVoxFile GetVoxFile(int handle) => GetAsset(handle)?.voxFile;
     public IList<Texture3D> GetTextures(int handle) => GetAsset(handle)?.textures;
-    public IList<GameObject> GetChunkCubes(int handle) => GetAsset(handle)?.chunkCubes;
     public IList<Material> GetMaterials(int handle) => GetAsset(handle)?.materials;
-    public IList<Vector3Int> GetChunkDims(int handle) => GetAsset(handle)?.chunkDims;
+    public IList<ChunkInfo> GetChunks(int handle) => GetAsset(handle)?.chunks;
+    public IList<VoxelElement> GetVoxelElements(int handle) => voxelElements;
+    public IList<MaterialElement> GetMaterialElements(int handle) => materialElements;
 
     /// <summary>已注册资产槽位总数（含已卸载的空槽）。</summary>
     public int Count => assets.Count;
@@ -143,9 +148,106 @@ public class VoxDataProvider : MonoBehaviour
             if (assets[i] != null && assets[i].isActive)
                 assets[i].Dispose();
         }
+        voxelElements.Clear();
+        materialElements.Clear();
     }
 
-    // ---- 内部：创建 chunk 立方体 + 3D 纹理 ----
+    // ---- 内部：构建材质表（自解析 MATL chunk 原始字节） ----
+    void BuildMaterialElements(IVoxFile voxFile, VoxAsset asset, int matBase)
+    {
+        // Phase A: 用 palette 为 256 槽填默认 Diffuse
+        for (int i = 0; i < 256; i++)
+        {
+            var me = new MaterialElement { type = MaterialType.Diffuse };
+            if (voxFile.Palette != null && voxFile.Palette.Colors != null && i < voxFile.Palette.Colors.Length)
+            {
+                var c = voxFile.Palette.Colors[i];
+                me.color = new Color(c.R / 255f, c.G / 255f, c.B / 255f, c.A / 255f);
+            }
+            materialElements.Add(me);  // 添加到全局列表
+        }
+    
+        // Phase B: 遍历递归找 MaterialNew chunk，自解析覆盖
+        ParseMaterialChunks(voxFile.Chunks, asset, matBase);
+    }
+    
+    void ParseMaterialChunks(IChunk[] chunks, VoxAsset asset, int matBase)
+    {
+        if (chunks == null) return;
+        foreach (var chunk in chunks)
+        {
+            if (chunk == null) continue;
+            if (chunk.Type == VoxReader.ChunkType.MaterialNew && chunk.Content != null && chunk.Content.Length >= 4)
+            {
+                ParseOneMaterial(chunk.Content, asset, matBase);
+            }
+            if (chunk.Children != null && chunk.Children.Length > 0)
+                ParseMaterialChunks(chunk.Children, asset, matBase);
+        }
+    }
+    
+    /// <summary>解析单个 MATL chunk 的 Content 字节：int32 id + DICT{string,string}。</summary>
+    void ParseOneMaterial(byte[] content, VoxAsset asset, int matBase)
+    {
+        int offset = 0;
+        int id = System.BitConverter.ToInt32(content, offset); offset += 4;
+        int slot = matBase + id - 1; // MATL id 1-based → 全局 0-based
+        if (slot < 0 || slot >= materialElements.Count) return;
+    
+        int pairCount = System.BitConverter.ToInt32(content, offset); offset += 4;
+        var me = materialElements[slot];
+    
+        for (int p = 0; p < pairCount && offset < content.Length; p++)
+        {
+            if (offset + 4 > content.Length) break;
+            int keyLen = System.BitConverter.ToInt32(content, offset); offset += 4;
+            if (offset + keyLen > content.Length) break;
+            string key = System.Text.Encoding.ASCII.GetString(content, offset, keyLen); offset += keyLen;
+    
+            if (offset + 4 > content.Length) break;
+            int valLen = System.BitConverter.ToInt32(content, offset); offset += 4;
+            if (offset + valLen > content.Length) break;
+            string val = System.Text.Encoding.ASCII.GetString(content, offset, valLen); offset += valLen;
+    
+            // 按 key 覆盖 MaterialElement 字段；未知 key 静默忽略（前向兼容）
+            switch (key)
+            {
+                case "_type":
+                    int mt; if (int.TryParse(val, out mt)) me.type = (MaterialType)mt;
+                    break;
+                case "_weight": float w; if (float.TryParse(val, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out w)) me.weight = w; break;
+                case "_rough":  float r; if (float.TryParse(val, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out r)) me.rough  = r; break;
+                case "_spec":   float s; if (float.TryParse(val, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out s)) me.spec   = s; break;
+                case "_ior":    float io; if (float.TryParse(val, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out io)) me.ior = io; break;
+                case "_att":    float at; if (float.TryParse(val, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out at)) me.att = at; break;
+                case "_flux":   float fl; if (float.TryParse(val, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out fl)) me.flux = fl; break;
+                // 未知 key 静默忽略
+            }
+        }
+        materialElements[slot] = me;
+    }
+
+    // ---- 内部：最小角本地映射（不带 +0.5, 去掉中心偏移, Vox YZ） ----
+    static Vector3 LocalPosMinToCubeLocal(Vector3Int lp, Vector3Int d)
+    {
+        return new Vector3(
+            lp.x / (float)d.x - 0.5f,
+            lp.z / (float)d.z - 0.5f,   // Vox Y → Unity Z
+            lp.y / (float)d.y - 0.5f);  // Vox Z → Unity Y
+    }
+
+    /// <summary>
+    /// 四舍五入到最近的整数（round half up），避免 Unity RoundToInt 的银行家舍入问题。
+    /// </summary>
+    static Vector3Int RoundToInt(Vector3 v)
+    {
+        return new Vector3Int(
+            Mathf.FloorToInt(v.x + 0.5f),
+            Mathf.FloorToInt(v.y + 0.5f),
+            Mathf.FloorToInt(v.z + 0.5f));
+    }
+
+    // ---- 内部：创建 chunk 立方体 + 3D 纹理 + voxelElements + ChunkInfo ----
     bool CreateChunks(IVoxFile voxFile, VoxAsset asset, Transform parent,
                       float scale, Material baseMat)
     {
@@ -161,6 +263,11 @@ public class VoxDataProvider : MonoBehaviour
             baseMat.name = "VoxGBuffer_Default";
         }
 
+        // Phase A: 构建 materialElements（chunk 循环前，一次）
+        int matBase = materialElements.Count;  // 记录当前资产的材质起始索引
+        BuildMaterialElements(voxFile, asset, matBase);
+
+        // Phase B: 逐 model 创建 Texture3D + chunk cube + voxelElements + ChunkInfo
         for (int i = 0; i < voxFile.Models.Length; i++)
         {
             var model = voxFile.Models[i];
@@ -189,7 +296,6 @@ public class VoxDataProvider : MonoBehaviour
             tex.SetPixels(pixels);
             tex.Apply(false, false);
             asset.textures.Add(tex);
-            asset.chunkDims.Add(new Vector3Int(sx, sy, sz));
 
             // ---- chunk 代理立方体 ----
             GameObject cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
@@ -210,6 +316,45 @@ public class VoxDataProvider : MonoBehaviour
                 localPos += chunkSize * 0.5f;
             cube.transform.localPosition = localPos;
 
+            // ---- ChunkInfo: 用世界空间位置算 worldMin/worldMax ----
+            var chunkInfo = new ChunkInfo();
+            chunkInfo.dims = new Vector3Int(sx, sy, sz);
+            
+            // 用 cube 的世界位置（包含父对象变换）计算 AABB
+            Vector3 worldPos = cube.transform.position;
+            Vector3 h = rot * (chunkSize * 0.5f);
+            Vector3 worldHalf = new Vector3(Mathf.Abs(h.x), Mathf.Abs(h.y), Mathf.Abs(h.z));
+            chunkInfo.worldMin = worldPos - worldHalf;
+            chunkInfo.worldMax = worldPos + worldHalf;
+            chunkInfo.cube = cube;
+
+            // ---- 新增：写扁平 voxelElements (scene-space 整数最小角) ----
+            int voxelCountBefore = voxelElements.Count;
+            int filteredCount = 0;
+            foreach (var voxel in model.Voxels)
+            {
+                int ix = (int)voxel.LocalPosition.X;
+                int iy = (int)voxel.LocalPosition.Y;
+                int iz = (int)voxel.LocalPosition.Z;
+                if (ix < 0 || ix >= sx || iy < 0 || iy >= sy || iz < 0 || iz >= sz) 
+                {
+                    filteredCount++;
+                    continue;
+                }
+            
+                Vector3 cubeLocal = LocalPosMinToCubeLocal(new Vector3Int(ix, iy, iz), new Vector3Int(sx, sy, sz));
+                //cubeLocal = cubeLocal - new Vector3(0.5f, 0.5f, 0.5f);
+                Vector3 worldMinCorner = cube.transform.TransformPoint(cubeLocal);
+                Vector3Int sceneMinCorner = Vector3Int.FloorToInt(worldMinCorner / scale);
+                voxelElements.Add(new VoxelElement  // 添加到全局列表
+                {
+                    worldPos = sceneMinCorner,
+                    materialIndex = matBase + voxel.ColorIndex  // 加上材质偏移
+                });
+            }
+            int addedCount = voxelElements.Count - voxelCountBefore;
+            Debug.Log($"[VoxDataProvider] Model '{model.Name}': 原始体素={model.Voxels.Length}, 添加={addedCount}, 过滤={filteredCount}");
+
             // ---- 材质实例（每 chunk 一个，绑定纹理与尺寸） ----
             var instMat = new Material(baseMat);
             instMat.name = $"Mat_{cube.name}";
@@ -218,9 +363,11 @@ public class VoxDataProvider : MonoBehaviour
             instMat.SetFloat("_VoxelScale", scale);
             cube.GetComponent<Renderer>().sharedMaterial = instMat;
             asset.materials.Add(instMat);
-            asset.chunkCubes.Add(cube);
+            asset.chunks.Add(chunkInfo);
         }
 
+        Debug.Log($"[VoxDataProvider] CreateChunks 完成：{asset.chunks.Count} chunks, " +
+                  $"{voxelElements.Count} voxelElements, {materialElements.Count} materialElements");
         return true;
     }
 
@@ -250,10 +397,11 @@ public class VoxDataProvider : MonoBehaviour
         foreach (var asset in assets)
         {
             if (asset == null || !asset.isActive) continue;
-            for (int i = 0; i < asset.chunkCubes.Count; i++)
+            for (int i = 0; i < asset.chunks.Count; i++)
             {
-                if (asset.chunkCubes[i] != null && asset.materials[i] != null)
-                    UpdateWorldAABB(asset.chunkCubes[i], asset.materials[i]);
+                var chunk = asset.chunks[i];
+                if (chunk != null && chunk.cube != null && i < asset.materials.Count && asset.materials[i] != null)
+                    UpdateWorldAABB(chunk.cube, asset.materials[i]);
             }
         }
     }
@@ -287,7 +435,7 @@ public class VoxDataProvider : MonoBehaviour
 }
 
 /// <summary>
-/// 一个已加载的 VOX 资产：包含解析数据、3D 纹理、chunk 立方体、材质。
+/// 一个已加载的 VOX 资产：包含解析数据、SVO 输入（扁平 GPU-ready 数组）、DDA pass 用资源。
 /// 由 VoxDataProvider 创建并管理生命周期。
 /// </summary>
 [System.Serializable]
@@ -295,10 +443,11 @@ public class VoxAsset
 {
     public string filePath;
     [System.NonSerialized] public IVoxFile voxFile;
+
+    // DDA pass 用：按 chunk 索引平行存储
+    public List<ChunkInfo> chunks   = new List<ChunkInfo>();
     public List<Texture3D> textures = new List<Texture3D>();
-    public List<GameObject> chunkCubes = new List<GameObject>();
-    public List<Material> materials = new List<Material>();
-    public List<Vector3Int> chunkDims = new List<Vector3Int>();
+    public List<Material>  materials = new List<Material>();
 
     /// <summary>标记资产是否有效。Dispose 后置为 false，参与序列化以跨重编译保持。</summary>
     public bool isActive = true;
@@ -306,22 +455,21 @@ public class VoxAsset
     /// <summary>销毁所有关联的 Unity 资源（立方体/材质/纹理）。</summary>
     public void Dispose()
     {
-        foreach (var c in chunkCubes)
+        foreach (var chunk in chunks)
         {
-            if (c != null)
+            if (chunk?.cube != null)
             {
-                c.SetActive(false);
-                UnityEngine.Object.DestroyImmediate(c);
+                chunk.cube.SetActive(false);
+                UnityEngine.Object.DestroyImmediate(chunk.cube);
             }
         }
         foreach (var m in materials)
             if (m != null) DestroyUnityObj(m);
         foreach (var t in textures)
             if (t != null) DestroyUnityObj(t);
-        chunkCubes.Clear();
+        chunks.Clear();
         materials.Clear();
         textures.Clear();
-        chunkDims.Clear();
         isActive = false;
     }
 
