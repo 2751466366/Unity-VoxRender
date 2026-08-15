@@ -1,0 +1,661 @@
+#pragma kernel CSMain
+
+// ============================================================
+//  SVO Ray Tracing 计算着色器（DDA 遍历版）
+//  沿相机射线遍历 SVO，命中体素后：
+//    1. 根据 AABB 进入面计算法线（参考 VoxRender_GBuffer.shader）
+//    2. 从命中点向光源方向发射阴影射线（沿法线略微偏移避免自碰撞）
+//    3. 阴影射线未命中 → 返回体素颜色（受光照）
+//       阴影射线命中   → 压暗颜色
+//    4. 相机射线未命中 → 返回天空颜色
+// ============================================================
+
+// ---- SVO 数据（由 SVOBuilder 上传） ----
+StructuredBuffer<uint4>   _SVONodes;       // childMask, data, flags, _pad
+StructuredBuffer<float4>  _SVOMaterials;   // 每 3 个 float4 一项 (48B)
+
+float3 _SVORootMin;   // 根节点最小角（世界空间）
+float  _SVOScale;     // 体素缩放
+int    _SVODepth;     // 八叉树深度
+
+// ---- 相机参数 ----
+float4x4 _InverseVP;  // 逆 ViewProjection（裁剪空间 → 世界空间）
+float3   _CameraPos;  // 相机世界坐标
+
+// ---- 光照参数 ----
+float3 _LightDir;     // 指向光源的方向（已归一化）
+float3 _LightColor;   // 光颜色 × 强度
+float  _Ambient;      // 环境光系数
+
+// ---- 天空颜色（CPU 从 Skybox Cubemap 采样后传入） ----
+float3 _SkyColor;
+
+// ---- 天空盒 Cubemap（可选，CPU 传入后优先使用） ----
+TextureCube _SkyboxTex;
+SamplerState sampler_SkyboxTex;
+float _HasSkyCube;  // 1.0 = Cubemap 已绑定，0.0 = 未绑定
+
+// ---- 输出 ----
+RWTexture2D<float4> _RayTracingResult;
+
+// ---- 常量 ----
+static const float EPSILON  = 1e-6f;
+static const int   MAX_STEPS = 4096;   // 深度 10 时根对角线约 3*1024 步
+
+// ============================================================
+//  SVO 查找：给定网格空间整数坐标，返回叶子节点的 materialIndex
+//  从根节点递归下降，不占用栈内存
+//  返回 -1 表示该坐标处无体素
+// ============================================================
+int SVOLookup(int3 gridCoord)
+{
+    int nodeIdx = 0;
+    int level = _SVODepth;
+    int3 nodeMin = int3(0, 0, 0);
+    
+    [loop]
+    while (level > 0)
+    {
+        uint4 node = _SVONodes[nodeIdx];
+        uint childMask = node.x;
+        uint data = node.y;
+        uint flags = node.z;
+        
+        // 如果当前节点是叶子（不应该发生，因为 level > 0），返回其材质
+        if ((flags & 256u) != 0u)
+            return (int)data;
+        
+        // 计算子象限索引
+        int half = 1 << (level - 1);
+        int cx = (gridCoord.x >= nodeMin.x + half) ? 1 : 0;
+        int cy = (gridCoord.y >= nodeMin.y + half) ? 1 : 0;
+        int cz = (gridCoord.z >= nodeMin.z + half) ? 1 : 0;
+        int c = cx | (cy << 1) | (cz << 2);
+        
+        // 如果该子象限不存在，返回 -1
+        if ((childMask & (1u << c)) == 0u)
+            return -1;
+        
+        // 下降到子节点
+        nodeIdx = (int)data + c;
+        nodeMin += int3(cx * half, cy * half, cz * half);
+        level--;
+    }
+    
+    // level == 0，当前节点应该是叶子
+    uint4 leafNode = _SVONodes[nodeIdx];
+    if ((leafNode.z & 256u) != 0u)
+        return (int)leafNode.y;
+    
+    return -1;
+}
+
+// ============================================================
+//  SVO 查询（扩展版）：返回体素状态 + 空区域层级
+//  返回值 emptyLevel：
+//    >= 0 → 该坐标位于尺寸 2^emptyLevel 的整块空区域内
+//           （childMask 缺失的最浅层，整块保证无任何体素）
+//     -1  → 该坐标被占用，matIndex 为叶子材质索引
+//  用途：阴影射线遇到空区域时按 2^emptyLevel 整块跳过，
+//        而不是逐体素步进
+// ============================================================
+int SVOLookupEx(int3 gridCoord, out int matIndex)
+{
+    matIndex = -1;
+    int nodeIdx = 0;
+    int level = _SVODepth;
+    int3 nodeMin = int3(0, 0, 0);
+    
+    [loop]
+    while (level > 0)
+    {
+        uint4 node = _SVONodes[nodeIdx];
+        uint childMask = node.x;
+        uint data     = node.y;
+        uint flags    = node.z;
+        
+        // 叶子 → 占用
+        if ((flags & 256u) != 0u)
+        {
+            matIndex = (int)data;
+            return -1;
+        }
+        
+        int half = 1 << (level - 1);
+        int cx = (gridCoord.x >= nodeMin.x + half) ? 1 : 0;
+        int cy = (gridCoord.y >= nodeMin.y + half) ? 1 : 0;
+        int cz = (gridCoord.z >= nodeMin.z + half) ? 1 : 0;
+        int c = cx | (cy << 1) | (cz << 2);
+        
+        // 子象限不存在 → 尺寸 2^(level-1) 的整块空区域
+        if ((childMask & (1u << c)) == 0u)
+            return level - 1;
+        
+        nodeIdx = (int)data + c;
+        nodeMin += int3(cx * half, cy * half, cz * half);
+        level--;
+    }
+    
+    // level == 0：体素级叶子
+    uint4 leafNode = _SVONodes[nodeIdx];
+    if ((leafNode.z & 256u) != 0u)
+    {
+        matIndex = (int)leafNode.y;
+        return -1;
+    }
+    
+    return 0;   // 单体素空区域
+}
+
+// ============================================================
+//  DDA 遍历 SVO —— 返回命中信息
+//  ro/rd 为网格空间（根 AABB = [0, rootSide]）
+//  out hitT:     命中距离（网格空间，射线参数 t，仅供调试）
+//  out hitNGrid: 命中面法线（网格空间，轴对齐）
+//  out hitSide:  叶子节点边长（始终为 1，因为是体素级 DDA）
+//  out hitVoxel: 命中体素的整数坐标（精确值，无浮点误差）
+//  返回 materialIndex，未命中返回 -1
+//  
+//  核心思路：
+//    - DDA 在体素级别步进（step = 1），保证严格按射线顺序访问
+//    - 每个体素位置查询 SVO 判断是否 occupied
+//    - 第一个 occupied 体素即为正面命中
+//    - 法线由 DDA 步进方向（stepAxis）直接确定
+//    - 返回精确的整数体素坐标，供阴影射线使用（避免浮点重建命中点
+//      产生的灾难性精度抵消 —— 相机越远误差越大，导致阴影自遮挡）
+// ============================================================
+int TraverseSVO_DDA(float3 ro, float3 rd,
+                    out float hitT, out float3 hitNGrid, out float hitSide,
+                    out int3 hitVoxel)
+{
+    hitT     = -1.0;
+    hitNGrid = float3(0, 1, 0);
+    hitSide  = 1.0;
+    hitVoxel = int3(0, 0, 0);
+    
+    float rootSide = exp2((float)_SVODepth);
+    
+    // 与根 AABB 相交
+    float3 rdInv = float3(
+        abs(rd.x) > EPSILON ? 1.0 / rd.x : 1e10 * sign(rd.x),
+        abs(rd.y) > EPSILON ? 1.0 / rd.y : 1e10 * sign(rd.y),
+        abs(rd.z) > EPSILON ? 1.0 / rd.z : 1e10 * sign(rd.z)
+    );
+    
+    float3 t0 = -ro * rdInv;
+    float3 t1 = (rootSide - ro) * rdInv;
+    float3 tMin3 = min(t0, t1);
+    float3 tMax3 = max(t0, t1);
+    float tEnter = max(max(tMin3.x, tMin3.y), tMin3.z);
+    float tExit  = min(min(tMax3.x, tMax3.y), tMax3.z);
+    
+    if (tEnter > tExit || tExit < 0.0)
+        return -1;
+    
+    tEnter = max(tEnter, 0.0);
+    
+    // DDA 初始化
+    float3 currentVoxel = floor(ro + rd * tEnter);
+    currentVoxel = clamp(currentVoxel, float3(0, 0, 0), float3(rootSide - 1, rootSide - 1, rootSide - 1));
+    
+    float3 stepDir = sign(rd);
+    float3 absRd = abs(rd);
+    
+    // 处理射线分量接近零的情况
+    bool zeroX = absRd.x < EPSILON;
+    bool zeroY = absRd.y < EPSILON;
+    bool zeroZ = absRd.z < EPSILON;
+    
+    float3 tDelta = float3(
+        zeroX ? 1e10 : 1.0 / absRd.x,
+        zeroY ? 1e10 : 1.0 / absRd.y,
+        zeroZ ? 1e10 : 1.0 / absRd.z
+    );
+    
+    // 初始 tMax：到达下一个体素边界的时间
+    float3 nextBoundary = stepDir > 0 ? currentVoxel + 1.0 : currentVoxel;
+    float3 tMax = (nextBoundary - (ro + rd * tEnter)) / rd;
+    if (zeroX) tMax.x = 1e10;
+    if (zeroY) tMax.y = 1e10;
+    if (zeroZ) tMax.z = 1e10;
+    
+    // 初始法线：根据进入根 AABB 的面确定
+    if (tEnter > 0.0)
+    {
+        // 从外部进入，法线由 tMin3 最大值的轴决定
+        if (tMin3.x >= tMin3.y && tMin3.x >= tMin3.z)
+            hitNGrid = float3(-sign(rd.x), 0, 0);
+        else if (tMin3.y >= tMin3.x && tMin3.y >= tMin3.z)
+            hitNGrid = float3(0, -sign(rd.y), 0);
+        else
+            hitNGrid = float3(0, 0, -sign(rd.z));
+    }
+    else
+    {
+        // 起点在 AABB 内部，法线由绝对值最大的射线分量决定
+        if (absRd.x >= absRd.y && absRd.x >= absRd.z)
+            hitNGrid = float3(-stepDir.x, 0, 0);
+        else if (absRd.y >= absRd.x && absRd.y >= absRd.z)
+            hitNGrid = float3(0, -stepDir.y, 0);
+        else
+            hitNGrid = float3(0, 0, -stepDir.z);
+    }
+    
+    // DDA 主循环
+    [loop]
+    for (int s = 0; s < MAX_STEPS; s++)
+    {
+        // 检查是否在有效范围内
+        if (any(currentVoxel < 0) || any(currentVoxel >= rootSide))
+            break;
+        
+        // 查询 SVO：当前体素是否 occupied
+        int3 coord = int3(currentVoxel);
+        int matIndex = SVOLookup(coord);
+        
+        if (matIndex >= 0)
+        {
+            // 命中！hitT 是当前体素的进入时间
+            hitT = tEnter;
+            hitSide = 1.0;
+            hitVoxel = coord;   // 精确整数坐标，零浮点误差
+            return matIndex;
+        }
+        
+        // 未命中，DDA 步进到下一个体素
+        // 记录进入当前体素的时间（用于下次命中时作为 hitT）
+        float stepT;
+        if (tMax.x < tMax.y)
+        {
+            if (tMax.x < tMax.z)
+            {
+                stepT = tMax.x;
+                currentVoxel.x += stepDir.x;
+                tMax.x += tDelta.x;
+                hitNGrid = float3(-stepDir.x, 0, 0);
+            }
+            else
+            {
+                stepT = tMax.z;
+                currentVoxel.z += stepDir.z;
+                tMax.z += tDelta.z;
+                hitNGrid = float3(0, 0, -stepDir.z);
+            }
+        }
+        else
+        {
+            if (tMax.y < tMax.z)
+            {
+                stepT = tMax.y;
+                currentVoxel.y += stepDir.y;
+                tMax.y += tDelta.y;
+                hitNGrid = float3(0, -stepDir.y, 0);
+            }
+            else
+            {
+                stepT = tMax.z;
+                currentVoxel.z += stepDir.z;
+                tMax.z += tDelta.z;
+                hitNGrid = float3(0, 0, -stepDir.z);
+            }
+        }
+        
+        // 更新 tEnter 为步进后的时间
+        tEnter = stepT;
+        
+        // 超出 AABB 则退出
+        if (tEnter > tExit)
+            break;
+    }
+    
+    return -1;
+}
+
+// ============================================================
+//  阴影射线：DDA 遍历检测沿 lightDir 是否命中体素
+//  ro/rd 为网格空间，返回 true = 被遮挡
+//  
+//  skipVoxel：跳过该体素的占据检测（即主射线的命中体素）。
+//  这从机制上消除自遮挡（shadow acne / 摩尔纹）：
+//    - 起点 = 命中体素中心（精确值，与相机距离无关）
+//    - 命中体素本身不作为遮挡物（几何上正确：光在法线一侧，
+//      命中体素不会遮挡从自己表面出发的阴影射线）
+//    - DDA 单调步进，同一体素不会被访问两次，跳过安全
+// ============================================================
+bool ShadowRayHit_DDA(float3 ro, float3 rd, int3 skipVoxel)
+{
+    float rootSide = exp2((float)_SVODepth);
+    
+    float3 rdInv = float3(
+        abs(rd.x) > EPSILON ? 1.0 / rd.x : 1e10 * sign(rd.x),
+        abs(rd.y) > EPSILON ? 1.0 / rd.y : 1e10 * sign(rd.y),
+        abs(rd.z) > EPSILON ? 1.0 / rd.z : 1e10 * sign(rd.z)
+    );
+    
+    float3 t0 = -ro * rdInv;
+    float3 t1 = (rootSide - ro) * rdInv;
+    float3 tMin3 = min(t0, t1);
+    float3 tMax3 = max(t0, t1);
+    float tEnter = max(max(tMin3.x, tMin3.y), tMin3.z);
+    float tExit  = min(min(tMax3.x, tMax3.y), tMax3.z);
+    
+    if (tEnter > tExit || tExit < 0.0)
+        return false;
+    
+    tEnter = max(tEnter, 0.0);
+    
+    float3 currentVoxel = floor(ro + rd * tEnter);
+    currentVoxel = clamp(currentVoxel, float3(0, 0, 0), float3(rootSide - 1, rootSide - 1, rootSide - 1));
+    
+    float3 stepDir = sign(rd);
+    float3 absRd = abs(rd);
+    
+    bool zeroX = absRd.x < EPSILON;
+    bool zeroY = absRd.y < EPSILON;
+    bool zeroZ = absRd.z < EPSILON;
+    
+    float3 tDelta = float3(
+        zeroX ? 1e10 : 1.0 / absRd.x,
+        zeroY ? 1e10 : 1.0 / absRd.y,
+        zeroZ ? 1e10 : 1.0 / absRd.z
+    );
+    
+    float3 nextBoundary = stepDir > 0 ? currentVoxel + 1.0 : currentVoxel;
+    float3 tMax = (nextBoundary - (ro + rd * tEnter)) / rd;
+    if (zeroX) tMax.x = 1e10;
+    if (zeroY) tMax.y = 1e10;
+    if (zeroZ) tMax.z = 1e10;
+    
+    [loop]
+    for (int s = 0; s < MAX_STEPS; s++)
+    {
+        if (any(currentVoxel < 0) || any(currentVoxel >= rootSide))
+            break;
+        
+        int3 coord = int3(currentVoxel);
+        
+        // 跳过命中体素本身（防自遮挡）
+        if (all(coord == skipVoxel))
+        {
+            // 不检测，直接步进到下一个体素
+        }
+        else
+        {
+            int matIndex = SVOLookup(coord);
+            if (matIndex >= 0)
+                return true;  // 命中体素 = 被遮挡
+        }
+        
+        // DDA 步进
+        if (tMax.x < tMax.y)
+        {
+            if (tMax.x < tMax.z)
+            {
+                tEnter = tMax.x;
+                currentVoxel.x += stepDir.x;
+                tMax.x += tDelta.x;
+            }
+            else
+            {
+                tEnter = tMax.z;
+                currentVoxel.z += stepDir.z;
+                tMax.z += tDelta.z;
+            }
+        }
+        else
+        {
+            if (tMax.y < tMax.z)
+            {
+                tEnter = tMax.y;
+                currentVoxel.y += stepDir.y;
+                tMax.y += tDelta.y;
+            }
+            else
+            {
+                tEnter = tMax.z;
+                currentVoxel.z += stepDir.z;
+                tMax.z += tDelta.z;
+            }
+        }
+        
+        if (tEnter > tExit)
+            break;
+    }
+    
+    return false;
+}
+
+// ============================================================
+//  阴影射线（快速版）：体素 DDA + 八叉树空区域跳过
+//  与 ShadowRayHit_DDA 功能完全相同（含 skipVoxel 语义），
+//  但利用 SVO 分层结构加速：
+//
+//  原版：每步进 1 个体素做一次 O(depth) 树下降
+//        穿越根 AABB ≈ 3×rootSide 步 × depth 次节点访问
+//  快版：SVOLookupEx 额外返回空区域层级 emptyLevel，
+//        空区域尺寸 side = 2^emptyLevel，射线一次跳过整块。
+//        模型外部大片空域在浅层即可跳过（单次最大 rootSide/2），
+//        复杂度 ≈ O(穿过的空区域数 + 接近遮挡物的体素步数)
+//
+//  无栈无递归：每次迭代要么步进 1 体素，要么跳过一整块空区域，
+//  两者都严格推进射线，保证终止
+// ============================================================
+bool ShadowRayHit_Fast(float3 ro, float3 rd, int3 skipVoxel)
+{
+    float rootSide = exp2((float)_SVODepth);
+    
+    // ---- 与根 AABB 求交 ----
+    float3 rdInv = float3(
+        abs(rd.x) > EPSILON ? 1.0 / rd.x : 1e10 * sign(rd.x),
+        abs(rd.y) > EPSILON ? 1.0 / rd.y : 1e10 * sign(rd.y),
+        abs(rd.z) > EPSILON ? 1.0 / rd.z : 1e10 * sign(rd.z)
+    );
+    
+    float3 t0 = -ro * rdInv;
+    float3 t1 = (rootSide - ro) * rdInv;
+    float3 tMin3 = min(t0, t1);
+    float3 tMax3 = max(t0, t1);
+    float tEnter = max(max(tMin3.x, tMin3.y), tMin3.z);
+    float tExit  = min(min(tMax3.x, tMax3.y), tMax3.z);
+    
+    if (tEnter > tExit || tExit < 0.0)
+        return false;
+    tEnter = max(tEnter, 0.0);
+    
+    // ---- 体素级 DDA 状态 ----
+    float3 stepDir = sign(rd);
+    float3 absRd = abs(rd);
+    bool zeroX = absRd.x < EPSILON;
+    bool zeroY = absRd.y < EPSILON;
+    bool zeroZ = absRd.z < EPSILON;
+    
+    float3 tDelta = float3(
+        zeroX ? 1e10 : 1.0 / absRd.x,
+        zeroY ? 1e10 : 1.0 / absRd.y,
+        zeroZ ? 1e10 : 1.0 / absRd.z
+    );
+    
+    float t = tEnter;
+    float3 pos = ro + rd * t;
+    float3 currentVoxel = clamp(floor(pos), float3(0, 0, 0), rootSide - 1.0);
+    
+    float3 nextBoundary = stepDir > 0 ? currentVoxel + 1.0 : currentVoxel;
+    float3 tMax = (nextBoundary - pos) / rd;
+    if (zeroX) tMax.x = 1e10;
+    if (zeroY) tMax.y = 1e10;
+    if (zeroZ) tMax.z = 1e10;
+    
+    // 跳过空区域时越过边界的推进量：最慢轴 1 体素时间的 1/1000，
+    // 保证所有轴都前进 ≥0.001 体素，floor 无边界歧义
+    float nudge = 1e-3 * max(max(tDelta.x, tDelta.y), tDelta.z);
+    
+    [loop]
+    for (int s = 0; s < MAX_STEPS; s++)
+    {
+        if (any(currentVoxel < 0) || any(currentVoxel >= rootSide))
+            break;
+        
+        int3 coord = int3(currentVoxel);
+        int matIdx;
+        int emptyLevel = SVOLookupEx(coord, matIdx);
+        
+        if (emptyLevel < 0)
+        {
+            // 占用体素：不是命中体素自身 → 被遮挡
+            if (matIdx >= 0 && !all(coord == skipVoxel))
+                return true;
+            
+            // 常规 DDA：步进一个体素
+            if (tMax.x < tMax.y)
+            {
+                if (tMax.x < tMax.z)
+                {
+                    t = tMax.x;
+                    currentVoxel.x += stepDir.x;
+                    tMax.x += tDelta.x;
+                }
+                else
+                {
+                    t = tMax.z;
+                    currentVoxel.z += stepDir.z;
+                    tMax.z += tDelta.z;
+                }
+            }
+            else
+            {
+                if (tMax.y < tMax.z)
+                {
+                    t = tMax.y;
+                    currentVoxel.y += stepDir.y;
+                    tMax.y += tDelta.y;
+                }
+                else
+                {
+                    t = tMax.z;
+                    currentVoxel.z += stepDir.z;
+                    tMax.z += tDelta.z;
+                }
+            }
+        }
+        else
+        {
+            // 空区域：尺寸 side = 2^emptyLevel，一次跳过整块
+            float side = exp2((float)emptyLevel);
+            float3 cellBase = floor(currentVoxel / side) * side;
+            
+            // 射线离开该空区域的时间增量（相对当前位置，逐轴取最早）
+            pos = ro + rd * t;
+            float3 tCell;
+            tCell.x = zeroX ? 1e10 :
+                (stepDir.x > 0 ? cellBase.x + side - pos.x : pos.x - cellBase.x) / absRd.x;
+            tCell.y = zeroY ? 1e10 :
+                (stepDir.y > 0 ? cellBase.y + side - pos.y : pos.y - cellBase.y) / absRd.y;
+            tCell.z = zeroZ ? 1e10 :
+                (stepDir.z > 0 ? cellBase.z + side - pos.z : pos.z - cellBase.z) / absRd.z;
+            
+            // 推进到空区域出口外一点（tCell 是相对增量，需叠加在当前 t 上）
+            t += min(min(tCell.x, tCell.y), tCell.z) + nudge;
+            if (t > tExit)
+                break;
+            
+            // 在新位置重建体素级 DDA 状态
+            pos = ro + rd * t;
+            currentVoxel = clamp(floor(pos), float3(0, 0, 0), rootSide - 1.0);
+            nextBoundary = stepDir > 0 ? currentVoxel + 1.0 : currentVoxel;
+            tMax = (nextBoundary - pos) / rd;
+            if (zeroX) tMax.x = 1e10;
+            if (zeroY) tMax.y = 1e10;
+            if (zeroZ) tMax.z = 1e10;
+        }
+        
+        if (t > tExit)
+            break;
+    }
+    
+    return false;
+}
+
+// ============================================================
+//  网格空间法线 → 世界空间法线
+//  SVO 坐标空间: world = grid * _SVOScale + _SVORootMin
+//  仅有均匀缩放 + VOX→Unity Y/Z 交换，无旋转
+//  缩放不影响法线方向，只需做 Y/Z 交换
+// ============================================================
+float3 GridNormalToWorld(float3 gridN)
+{
+    return normalize(float3(gridN.x, gridN.z, gridN.y));
+}
+
+// ============================================================
+//  CSMain — 每像素 SVO 光线追踪 + 硬阴影
+// ============================================================
+[numthreads(8, 8, 1)]
+void CSMain(uint3 dtid : SV_DispatchThreadID)
+{
+    uint2 pixel = dtid.xy;
+    uint2 dims;
+    _RayTracingResult.GetDimensions(dims.x, dims.y);
+    if (pixel.x >= dims.x || pixel.y >= dims.y) return;
+
+    // ---- 构建相机射线（世界空间） ----
+    float2 uv = (float2(pixel) + 0.5) / float2(dims);
+    float4 clipPos = float4(uv * 2.0 - 1.0, 1.0, 1.0);
+    float4 farWorldPos = mul(_InverseVP, clipPos);
+    farWorldPos /= farWorldPos.w;
+
+    float3 rd = normalize(farWorldPos.xyz - _CameraPos);
+    float3 ro = _CameraPos;
+
+    // ---- 世界空间 → 网格空间 ----
+    float3 roGrid = (ro - _SVORootMin) / _SVOScale;
+    float3 rdGrid = rd / _SVOScale;
+
+    // ---- SVO 遍历（主射线，DDA 版） ----
+    float hitT, hitSide;
+    float3 hitNGrid;
+    int3 hitVoxel;
+    int matIndex = TraverseSVO_DDA(roGrid, rdGrid, hitT, hitNGrid, hitSide, hitVoxel);
+
+    if (matIndex < 0)
+    {
+        // 未命中任何体素 → 采样 Skybox Cubemap 或使用纯色
+        float3 skyCol = _SkyColor;
+        if (_HasSkyCube > 0.5)
+            skyCol = _SkyboxTex.SampleLevel(sampler_SkyboxTex, rd, 0).rgb;
+        _RayTracingResult[pixel] = float4(skyCol, 1.0);
+        return;
+    }
+
+    // ---- 读取材质颜色 ----
+    float3 voxelColor = float3(0.5, 0.5, 0.5);
+    int matDataIdx = matIndex * 3 + 2;
+    if (matDataIdx < _SVOMaterials.Length)
+    {
+        voxelColor = _SVOMaterials[matDataIdx].rgb;
+        voxelColor = pow(max(voxelColor, 0.0), 1.0 / 2.2);
+    }
+
+    // ---- 法线：网格空间 → 世界空间 ----
+    float3 worldNormal = GridNormalToWorld(hitNGrid);
+
+    // ---- 阴影射线（DDA 版，精确起点，无浮点 bias） ----
+    // 起点 = 命中体素中心（整数 + 0.5，精确表示，与相机距离无关）
+    // 命中体素本身通过 skipVoxel 跳过检测，从机制上消除自遮挡
+    float3 shadowRoGrid = float3(hitVoxel) + 0.5;
+    float3 shadowRdGrid = normalize(_LightDir) / _SVOScale;
+
+    bool shadowed = ShadowRayHit_Fast(shadowRoGrid, shadowRdGrid, hitVoxel);
+
+    // ---- 光照合成 ----
+    float ndotl = max(0.0, dot(worldNormal, _LightDir));
+    float3 diffuse = voxelColor * _LightColor * ndotl;
+    float3 ambient = voxelColor * _Ambient;
+
+    float3 finalColor;
+    if (shadowed)
+        finalColor = ambient;          // 被遮挡：仅环境光
+    else
+        finalColor = diffuse + ambient; // 未被遮挡：漫反射 + 环境光
+
+    _RayTracingResult[pixel] = float4(finalColor, 1.0);
+}

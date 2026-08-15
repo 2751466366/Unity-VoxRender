@@ -15,7 +15,7 @@ using UnityEngine.Rendering;
 ///   3. 场景中放一个 Directional Light
 /// </summary>
 // [ExecuteInEditMode]
-public class DeferredPipeline : MonoBehaviour
+public class CameraRender : MonoBehaviour
 {
     [Header("Lighting Settings")]
     [Range(0f, 1f)] public float ambient = 0.2f;
@@ -27,6 +27,9 @@ public class DeferredPipeline : MonoBehaviour
     [Tooltip("SVO 射线遍历计算着色器（拖入 SVO_RayCast.compute）")]
     public ComputeShader svoRayCast;
 
+    [Tooltip("SVO 光线追踪计算着色器（拖入 SVO_RayTracing.compute）")]
+    public ComputeShader svoRayTracing;
+
     public enum DebugView
     {
         Final,
@@ -34,6 +37,7 @@ public class DeferredPipeline : MonoBehaviour
         Normal,
         WorldPos,
         SVOVisual,
+        RayTracing,
     }
 
     private Camera cam;
@@ -46,6 +50,9 @@ public class DeferredPipeline : MonoBehaviour
 
     // SVO 可视化 RT（OnPreRender 中渲染，OnRenderImage 中 Blit）
     private RenderTexture svoVisRT;
+
+    // SVO 光线追踪 RT
+    private RenderTexture rayTracingRT;
 
     // G-Buffer RenderTextures
     private RenderTexture gBufferAlbedo;    // RT0: RGBA32，深度 24-bit
@@ -68,7 +75,7 @@ public class DeferredPipeline : MonoBehaviour
         cam = GetComponent<Camera>();
         if (cam == null)
         {
-            Debug.LogError("[DeferredPipeline] 必须挂载到 Camera 上");
+            Debug.LogError("[CameraRender] 必须挂载到 Camera 上");
             return;
         }
 
@@ -76,7 +83,7 @@ public class DeferredPipeline : MonoBehaviour
         Shader lightingShader = Shader.Find("Hidden/VoxRender_Lighting");
         if (lightingShader == null)
         {
-            Debug.LogError("[DeferredPipeline] 未找到 Hidden/VoxRender_Lighting shader");
+            Debug.LogError("[CameraRender] 未找到 Hidden/VoxRender_Lighting shader");
             return;
         }
         lightingMat = new Material(lightingShader);
@@ -115,6 +122,14 @@ public class DeferredPipeline : MonoBehaviour
             svoVisRT = null;
         }
 
+        if (rayTracingRT != null)
+        {
+            rayTracingRT.Release();
+            if (Application.isPlaying) Destroy(rayTracingRT);
+            else DestroyImmediate(rayTracingRT);
+            rayTracingRT = null;
+        }
+
         if (lightingMat != null)
         {
             if (Application.isPlaying) Destroy(lightingMat);
@@ -134,11 +149,23 @@ public class DeferredPipeline : MonoBehaviour
     {
         EnsureRTs();
         TryBuildSVO();
-        RebuildCommandBuffer();
 
-        // SVO 可视化：在 OnPreRender 中 dispatch 计算着色器，避免在 OnRenderImage 中 dispatch 导致管线状态损坏
-        if (debugView == DebugView.SVOVisual && svoBuilt)
-            DispatchSVORayCastPre();
+        if (debugView == DebugView.RayTracing)
+        {
+            // RayTracing 模式：不需要 GBuffer，隐藏 chunk cube 的标准渲染
+            SetChunkRenderersEnabled(false);
+            if (svoBuilt)
+                DispatchSVORayTracingPre();
+        }
+        else
+        {
+            // 其他模式：恢复 chunk cube 渲染，走 GBuffer 管线
+            SetChunkRenderersEnabled(true);
+            RebuildCommandBuffer();
+
+            if (debugView == DebugView.SVOVisual && svoBuilt)
+                DispatchSVORayCastPre();
+        }
     }
 
     /// <summary>检查是否需要构建 SVO：VoxDataProvider 有已加载资产且尚未构建。</summary>
@@ -330,6 +357,12 @@ public class DeferredPipeline : MonoBehaviour
                 else
                     Graphics.Blit(src, dest);
                 break;
+            case DebugView.RayTracing:
+                if (rayTracingRT != null)
+                    Graphics.Blit(rayTracingRT, dest);
+                else
+                    Graphics.Blit(src, dest);
+                break;
             default:
                 // ===== Pass 3: 光照合成 =====
                 SetLightParameters();
@@ -414,4 +447,100 @@ public class DeferredPipeline : MonoBehaviour
     }
 
     private bool _svoVisLogged = false;
+
+    /// <summary>启用/禁用所有 chunk cube 的 MeshRenderer（防止标准管线渲染覆盖计算着色器输出）。</summary>
+    void SetChunkRenderersEnabled(bool enabled)
+    {
+        var provider = VoxDataProvider.Instance;
+        if (provider == null) return;
+        foreach (var asset in provider.Assets)
+        {
+            if (asset == null || !asset.isActive) continue;
+            foreach (var chunk in asset.chunks)
+            {
+                if (chunk?.cube == null) continue;
+                var renderer = chunk.cube.GetComponent<MeshRenderer>();
+                if (renderer != null) renderer.enabled = enabled;
+            }
+        }
+    }
+
+    /// <summary>在 OnPreRender 中调度 SVO 光线追踪计算着色器，渲染到 rayTracingRT。</summary>
+    void DispatchSVORayTracingPre()
+    {
+        if (svoRayTracing == null || cam == null) return;
+
+        int w = cam.pixelWidth;
+        int h = cam.pixelHeight;
+        if (w <= 0 || h <= 0) return;
+
+        int kernel = svoRayTracing.FindKernel("CSMain");
+        if (kernel < 0)
+        {
+            Debug.LogError("[RayTracing] 计算着色器找不到 CSMain kernel");
+            return;
+        }
+
+        // 创建或重建 RT
+        if (rayTracingRT == null || rayTracingRT.width != w || rayTracingRT.height != h)
+        {
+            if (rayTracingRT != null) { rayTracingRT.Release(); Destroy(rayTracingRT); }
+            rayTracingRT = new RenderTexture(w, h, 0, RenderTextureFormat.ARGBFloat);
+            rayTracingRT.enableRandomWrite = true;
+            rayTracingRT.name = "RayTracing_RT";
+            rayTracingRT.Create();
+        }
+
+        try
+        {
+            Matrix4x4 vp = GL.GetGPUProjectionMatrix(cam.projectionMatrix, false) * cam.worldToCameraMatrix;
+            svoRayTracing.SetMatrix("_InverseVP", vp.inverse);
+            svoRayTracing.SetVector("_CameraPos", cam.transform.position);
+            svoRayTracing.SetTexture(kernel, "_RayTracingResult", rayTracingRT);
+
+            // 光照参数
+            Vector3 lightDir = new Vector3(0.5f, 0.8f, 0.3f).normalized;
+            Vector3 lightColor = new Vector3(1f, 1f, 1f);
+            var lights = FindObjectsOfType<Light>();
+            foreach (var l in lights)
+            {
+                if (l.type == LightType.Directional && l.isActiveAndEnabled)
+                {
+                    lightDir = -l.transform.forward;
+                    lightColor = (Vector4)l.color * l.intensity;
+                    break;
+                }
+            }
+            svoRayTracing.SetVector("_LightDir", lightDir);
+            svoRayTracing.SetVector("_LightColor", lightColor);
+            svoRayTracing.SetFloat("_Ambient", ambient);
+
+            // 天空颜色：尝试将 Skybox Cubemap 传给计算着色器在 GPU 端采样
+            Vector3 skyColor = new Vector3(0.15f, 0.25f, 0.85f); // 回退默认蓝色
+            Cubemap skyCubemap = null;
+            var skybox = cam.GetComponent<Skybox>();
+            if (skybox != null && skybox.material != null && skybox.material.HasProperty("_Tex"))
+                skyCubemap = skybox.material.GetTexture("_Tex") as Cubemap;
+            if (skyCubemap == null && RenderSettings.skybox != null && RenderSettings.skybox.HasProperty("_Tex"))
+                skyCubemap = RenderSettings.skybox.GetTexture("_Tex") as Cubemap;
+            if (skyCubemap != null)
+            {
+                svoRayTracing.SetTexture(kernel, "_SkyboxTex", skyCubemap);
+                svoRayTracing.SetFloat("_HasSkyCube", 1.0f);
+            }
+            else
+            {
+                svoRayTracing.SetFloat("_HasSkyCube", 0.0f);
+            }
+            svoRayTracing.SetVector("_SkyColor", skyColor);
+
+            uint tgX, tgY, tgZ;
+            svoRayTracing.GetKernelThreadGroupSizes(kernel, out tgX, out tgY, out tgZ);
+            svoRayTracing.Dispatch(kernel, Mathf.CeilToInt(w / (float)tgX), Mathf.CeilToInt(h / (float)tgY), 1);
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogError($"[RayTracing] 计算着色器调度失败: {ex.Message}");
+        }
+    }
 }

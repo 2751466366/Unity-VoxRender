@@ -388,8 +388,9 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   ambient: 0.2
-  debugView: 4
+  debugView: 5
   svoRayCast: {fileID: 7200000, guid: b0dcbd8cf0fe0274f9c3331883e5307f, type: 3}
+  svoRayTracing: {fileID: 7200000, guid: a7f3e2b1c9d4846e8a5f10c2d3e67b94, type: 3}
 --- !u!1 &1171443738
 GameObject:
   m_ObjectHideFlags: 0
@@ -433,7 +434,7 @@ Transform:
   m_GameObject: {fileID: 1171443738}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: -40, y: 0, z: 0}
+  m_LocalPosition: {x: -40, y: -10, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -487,15 +488,11 @@ MonoBehaviour:
   defaultChunkMaterial: {fileID: 0}
   assets:
   - filePath: Assets/Scenes/Vox/castle-all.vox
-    voxelElements: []
-    materialElements: []
     chunks: []
     textures: []
     materials: []
     isActive: 0
   - filePath: Assets/Scenes/Vox/castle.vox
-    voxelElements: []
-    materialElements: []
     chunks: []
     textures: []
     materials: []

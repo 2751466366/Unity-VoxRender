@@ -136,21 +136,6 @@ public static class SVOBuilder
         Shader.SetGlobalInt   ("_SVODepth",     depth);
 
         Debug.Log($"[SVOBuilder] Phase 3: GPU 上传完成 — nodes={pool.Count}, materials={provider.materialElements.Count}");
-
-        // 通知 SVODebugGizmos 组件（如果存在）
-        NotifyDebugGizmos(pool, rootMin, scale, depth);
-    }
-
-    /// <summary>
-    /// 查找场景中的 SVODebugGizmos 组件并传入节点数据。
-    /// </summary>
-    static void NotifyDebugGizmos(List<SVONode> pool, Vector3Int rootMin, float scale, int depth)
-    {
-        var gizmos = Object.FindFirstObjectByType<SVODebugGizmos>();
-        if (gizmos != null)
-        {
-            gizmos.SetSVOData(pool, (Vector3)rootMin * scale, scale, depth);
-        }
     }
 
     /// <summary>
