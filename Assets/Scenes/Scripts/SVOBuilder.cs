@@ -50,21 +50,15 @@ public static class SVOBuilder
         }
 
         // ========================
-        // Phase 1: Scene Bounds
+        // Phase 1: Scene Bounds（直接从体素坐标计算 tight bounds）
         // ========================
         Vector3Int gridOrigin = new Vector3Int(int.MaxValue, int.MaxValue, int.MaxValue);
         Vector3Int gridMax    = new Vector3Int(int.MinValue, int.MinValue, int.MinValue);
 
-        foreach (var asset in activeAssets)
+        foreach (var v in provider.voxelElements)
         {
-            foreach (var chunk in asset.chunks)
-            {
-                if (chunk == null) continue;
-                Vector3Int cMin = Vector3Int.FloorToInt(chunk.worldMin / scale);
-                Vector3Int cMax = Vector3Int.CeilToInt(chunk.worldMax / scale) - Vector3Int.one;
-                gridOrigin = Vector3Int.Min(gridOrigin, cMin);
-                gridMax    = Vector3Int.Max(gridMax, cMax);
-            }
+            gridOrigin = Vector3Int.Min(gridOrigin, v.worldPos);
+            gridMax    = Vector3Int.Max(gridMax, v.worldPos);
         }
 
         // 计算 octree depth / rootSide
@@ -84,16 +78,6 @@ public static class SVOBuilder
         // ========================
         var pool = new List<SVONode>();
         pool.Add(new SVONode()); // pool[0] = 根节点
-
-        // 诊断：计算全局体素列表的边界
-        Vector3Int voxelMin = new Vector3Int(int.MaxValue, int.MaxValue, int.MaxValue);
-        Vector3Int voxelMax = new Vector3Int(int.MinValue, int.MinValue, int.MinValue);
-        foreach (var v in provider.voxelElements)
-        {
-            voxelMin = Vector3Int.Min(voxelMin, v.worldPos);
-            voxelMax = Vector3Int.Max(voxelMax, v.worldPos);
-        }
-        Debug.Log($"[SVOBuilder] 全局体素边界：min={voxelMin}, max={voxelMax}, 总数={provider.voxelElements.Count}");
 
         int leafCount = 0;
         int duplicateCount = 0;

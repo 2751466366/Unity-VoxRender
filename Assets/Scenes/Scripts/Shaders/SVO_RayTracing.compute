@@ -91,63 +91,6 @@ int SVOLookup(int3 gridCoord)
 }
 
 // ============================================================
-//  SVO 查询（扩展版）：返回体素状态 + 空区域层级
-//  返回值 emptyLevel：
-//    >= 0 → 该坐标位于尺寸 2^emptyLevel 的整块空区域内
-//           （childMask 缺失的最浅层，整块保证无任何体素）
-//     -1  → 该坐标被占用，matIndex 为叶子材质索引
-//  用途：阴影射线遇到空区域时按 2^emptyLevel 整块跳过，
-//        而不是逐体素步进
-// ============================================================
-int SVOLookupEx(int3 gridCoord, out int matIndex)
-{
-    matIndex = -1;
-    int nodeIdx = 0;
-    int level = _SVODepth;
-    int3 nodeMin = int3(0, 0, 0);
-    
-    [loop]
-    while (level > 0)
-    {
-        uint4 node = _SVONodes[nodeIdx];
-        uint childMask = node.x;
-        uint data     = node.y;
-        uint flags    = node.z;
-        
-        // 叶子 → 占用
-        if ((flags & 256u) != 0u)
-        {
-            matIndex = (int)data;
-            return -1;
-        }
-        
-        int half = 1 << (level - 1);
-        int cx = (gridCoord.x >= nodeMin.x + half) ? 1 : 0;
-        int cy = (gridCoord.y >= nodeMin.y + half) ? 1 : 0;
-        int cz = (gridCoord.z >= nodeMin.z + half) ? 1 : 0;
-        int c = cx | (cy << 1) | (cz << 2);
-        
-        // 子象限不存在 → 尺寸 2^(level-1) 的整块空区域
-        if ((childMask & (1u << c)) == 0u)
-            return level - 1;
-        
-        nodeIdx = (int)data + c;
-        nodeMin += int3(cx * half, cy * half, cz * half);
-        level--;
-    }
-    
-    // level == 0：体素级叶子
-    uint4 leafNode = _SVONodes[nodeIdx];
-    if ((leafNode.z & 256u) != 0u)
-    {
-        matIndex = (int)leafNode.y;
-        return -1;
-    }
-    
-    return 0;   // 单体素空区域
-}
-
-// ============================================================
 //  DDA 遍历 SVO —— 返回命中信息
 //  ro/rd 为网格空间（根 AABB = [0, rootSide]）
 //  out hitT:     命中距离（网格空间，射线参数 t，仅供调试）
@@ -426,156 +369,6 @@ bool ShadowRayHit_DDA(float3 ro, float3 rd, int3 skipVoxel)
 }
 
 // ============================================================
-//  阴影射线（快速版）：体素 DDA + 八叉树空区域跳过
-//  与 ShadowRayHit_DDA 功能完全相同（含 skipVoxel 语义），
-//  但利用 SVO 分层结构加速：
-//
-//  原版：每步进 1 个体素做一次 O(depth) 树下降
-//        穿越根 AABB ≈ 3×rootSide 步 × depth 次节点访问
-//  快版：SVOLookupEx 额外返回空区域层级 emptyLevel，
-//        空区域尺寸 side = 2^emptyLevel，射线一次跳过整块。
-//        模型外部大片空域在浅层即可跳过（单次最大 rootSide/2），
-//        复杂度 ≈ O(穿过的空区域数 + 接近遮挡物的体素步数)
-//
-//  无栈无递归：每次迭代要么步进 1 体素，要么跳过一整块空区域，
-//  两者都严格推进射线，保证终止
-// ============================================================
-bool ShadowRayHit_Fast(float3 ro, float3 rd, int3 skipVoxel)
-{
-    float rootSide = exp2((float)_SVODepth);
-    
-    // ---- 与根 AABB 求交 ----
-    float3 rdInv = float3(
-        abs(rd.x) > EPSILON ? 1.0 / rd.x : 1e10 * sign(rd.x),
-        abs(rd.y) > EPSILON ? 1.0 / rd.y : 1e10 * sign(rd.y),
-        abs(rd.z) > EPSILON ? 1.0 / rd.z : 1e10 * sign(rd.z)
-    );
-    
-    float3 t0 = -ro * rdInv;
-    float3 t1 = (rootSide - ro) * rdInv;
-    float3 tMin3 = min(t0, t1);
-    float3 tMax3 = max(t0, t1);
-    float tEnter = max(max(tMin3.x, tMin3.y), tMin3.z);
-    float tExit  = min(min(tMax3.x, tMax3.y), tMax3.z);
-    
-    if (tEnter > tExit || tExit < 0.0)
-        return false;
-    tEnter = max(tEnter, 0.0);
-    
-    // ---- 体素级 DDA 状态 ----
-    float3 stepDir = sign(rd);
-    float3 absRd = abs(rd);
-    bool zeroX = absRd.x < EPSILON;
-    bool zeroY = absRd.y < EPSILON;
-    bool zeroZ = absRd.z < EPSILON;
-    
-    float3 tDelta = float3(
-        zeroX ? 1e10 : 1.0 / absRd.x,
-        zeroY ? 1e10 : 1.0 / absRd.y,
-        zeroZ ? 1e10 : 1.0 / absRd.z
-    );
-    
-    float t = tEnter;
-    float3 pos = ro + rd * t;
-    float3 currentVoxel = clamp(floor(pos), float3(0, 0, 0), rootSide - 1.0);
-    
-    float3 nextBoundary = stepDir > 0 ? currentVoxel + 1.0 : currentVoxel;
-    float3 tMax = (nextBoundary - pos) / rd;
-    if (zeroX) tMax.x = 1e10;
-    if (zeroY) tMax.y = 1e10;
-    if (zeroZ) tMax.z = 1e10;
-    
-    // 跳过空区域时越过边界的推进量：最慢轴 1 体素时间的 1/1000，
-    // 保证所有轴都前进 ≥0.001 体素，floor 无边界歧义
-    float nudge = 1e-3 * max(max(tDelta.x, tDelta.y), tDelta.z);
-    
-    [loop]
-    for (int s = 0; s < MAX_STEPS; s++)
-    {
-        if (any(currentVoxel < 0) || any(currentVoxel >= rootSide))
-            break;
-        
-        int3 coord = int3(currentVoxel);
-        int matIdx;
-        int emptyLevel = SVOLookupEx(coord, matIdx);
-        
-        if (emptyLevel < 0)
-        {
-            // 占用体素：不是命中体素自身 → 被遮挡
-            if (matIdx >= 0 && !all(coord == skipVoxel))
-                return true;
-            
-            // 常规 DDA：步进一个体素
-            if (tMax.x < tMax.y)
-            {
-                if (tMax.x < tMax.z)
-                {
-                    t = tMax.x;
-                    currentVoxel.x += stepDir.x;
-                    tMax.x += tDelta.x;
-                }
-                else
-                {
-                    t = tMax.z;
-                    currentVoxel.z += stepDir.z;
-                    tMax.z += tDelta.z;
-                }
-            }
-            else
-            {
-                if (tMax.y < tMax.z)
-                {
-                    t = tMax.y;
-                    currentVoxel.y += stepDir.y;
-                    tMax.y += tDelta.y;
-                }
-                else
-                {
-                    t = tMax.z;
-                    currentVoxel.z += stepDir.z;
-                    tMax.z += tDelta.z;
-                }
-            }
-        }
-        else
-        {
-            // 空区域：尺寸 side = 2^emptyLevel，一次跳过整块
-            float side = exp2((float)emptyLevel);
-            float3 cellBase = floor(currentVoxel / side) * side;
-            
-            // 射线离开该空区域的时间增量（相对当前位置，逐轴取最早）
-            pos = ro + rd * t;
-            float3 tCell;
-            tCell.x = zeroX ? 1e10 :
-                (stepDir.x > 0 ? cellBase.x + side - pos.x : pos.x - cellBase.x) / absRd.x;
-            tCell.y = zeroY ? 1e10 :
-                (stepDir.y > 0 ? cellBase.y + side - pos.y : pos.y - cellBase.y) / absRd.y;
-            tCell.z = zeroZ ? 1e10 :
-                (stepDir.z > 0 ? cellBase.z + side - pos.z : pos.z - cellBase.z) / absRd.z;
-            
-            // 推进到空区域出口外一点（tCell 是相对增量，需叠加在当前 t 上）
-            t += min(min(tCell.x, tCell.y), tCell.z) + nudge;
-            if (t > tExit)
-                break;
-            
-            // 在新位置重建体素级 DDA 状态
-            pos = ro + rd * t;
-            currentVoxel = clamp(floor(pos), float3(0, 0, 0), rootSide - 1.0);
-            nextBoundary = stepDir > 0 ? currentVoxel + 1.0 : currentVoxel;
-            tMax = (nextBoundary - pos) / rd;
-            if (zeroX) tMax.x = 1e10;
-            if (zeroY) tMax.y = 1e10;
-            if (zeroZ) tMax.z = 1e10;
-        }
-        
-        if (t > tExit)
-            break;
-    }
-    
-    return false;
-}
-
-// ============================================================
 //  网格空间法线 → 世界空间法线
 //  SVO 坐标空间: world = grid * _SVOScale + _SVORootMin
 //  仅有均匀缩放 + VOX→Unity Y/Z 交换，无旋转
@@ -610,7 +403,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float3 roGrid = (ro - _SVORootMin) / _SVOScale;
     float3 rdGrid = rd / _SVOScale;
 
-    // ---- SVO 遍历（主射线，DDA 版） ----
+    // ---- SVO 遍历（主射线，DDA 体素级步进） ----
     float hitT, hitSide;
     float3 hitNGrid;
     int3 hitVoxel;
@@ -628,7 +421,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
     // ---- 读取材质颜色 ----
     float3 voxelColor = float3(0.5, 0.5, 0.5);
-    int matDataIdx = matIndex * 3 + 2;
+    uint matDataIdx = (uint)(matIndex * 3 + 2);
     if (matDataIdx < _SVOMaterials.Length)
     {
         voxelColor = _SVOMaterials[matDataIdx].rgb;
@@ -644,7 +437,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float3 shadowRoGrid = float3(hitVoxel) + 0.5;
     float3 shadowRdGrid = normalize(_LightDir) / _SVOScale;
 
-    bool shadowed = ShadowRayHit_Fast(shadowRoGrid, shadowRdGrid, hitVoxel);
+    bool shadowed = ShadowRayHit_DDA(shadowRoGrid, shadowRdGrid, hitVoxel);
 
     // ---- 光照合成 ----
     float ndotl = max(0.0, dot(worldNormal, _LightDir));
