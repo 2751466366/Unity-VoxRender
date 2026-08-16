@@ -30,6 +30,12 @@ public class CameraRender : MonoBehaviour
     [Tooltip("SVO 光线追踪计算着色器（拖入 SVO_RayTracing.compute）")]
     public ComputeShader svoRayTracing;
 
+    [Tooltip("SVO 路径追踪计算着色器（拖入 SVO_PathTracing.compute）")]
+    public ComputeShader svoPathTracing;
+
+    [Header("Path Tracing")]
+    [Range(1, 16)] public int maxBounceDepth = 4;
+
     public enum DebugView
     {
         Final,
@@ -38,6 +44,7 @@ public class CameraRender : MonoBehaviour
         WorldPos,
         SVOVisual,
         RayTracing,
+        PathTracing,
     }
 
     private Camera cam;
@@ -53,6 +60,12 @@ public class CameraRender : MonoBehaviour
 
     // SVO 光线追踪 RT
     private RenderTexture rayTracingRT;
+
+    // SVO 路径追踪 RT
+    private RenderTexture pathTracingRT;
+    private int pathTracingFrameCount = 0;
+    private Matrix4x4 prevViewMatrix;
+    private Matrix4x4 prevProjMatrix;
 
     // G-Buffer RenderTextures
     private RenderTexture gBufferAlbedo;    // RT0: RGBA32，深度 24-bit
@@ -130,6 +143,14 @@ public class CameraRender : MonoBehaviour
             rayTracingRT = null;
         }
 
+        if (pathTracingRT != null)
+        {
+            pathTracingRT.Release();
+            if (Application.isPlaying) Destroy(pathTracingRT);
+            else DestroyImmediate(pathTracingRT);
+            pathTracingRT = null;
+        }
+
         if (lightingMat != null)
         {
             if (Application.isPlaying) Destroy(lightingMat);
@@ -152,10 +173,15 @@ public class CameraRender : MonoBehaviour
 
         if (debugView == DebugView.RayTracing)
         {
-            // RayTracing 模式：不需要 GBuffer，隐藏 chunk cube 的标准渲染
             SetChunkRenderersEnabled(false);
             if (svoBuilt)
                 DispatchSVORayTracingPre();
+        }
+        else if (debugView == DebugView.PathTracing)
+        {
+            SetChunkRenderersEnabled(false);
+            if (svoBuilt)
+                DispatchSVOPathTracingPre();
         }
         else
         {
@@ -363,6 +389,12 @@ public class CameraRender : MonoBehaviour
                 else
                     Graphics.Blit(src, dest);
                 break;
+            case DebugView.PathTracing:
+                if (pathTracingRT != null)
+                    Graphics.Blit(pathTracingRT, dest);
+                else
+                    Graphics.Blit(src, dest);
+                break;
             default:
                 // ===== Pass 3: 光照合成 =====
                 SetLightParameters();
@@ -462,6 +494,93 @@ public class CameraRender : MonoBehaviour
                 var renderer = chunk.cube.GetComponent<MeshRenderer>();
                 if (renderer != null) renderer.enabled = enabled;
             }
+        }
+    }
+
+    /// <summary>在 OnPreRender 中调度 SVO 路径追踪计算着色器，渲染到 pathTracingRT。</summary>
+    void DispatchSVOPathTracingPre()
+    {
+        if (svoPathTracing == null || cam == null) return;
+
+        int w = cam.pixelWidth;
+        int h = cam.pixelHeight;
+        if (w <= 0 || h <= 0) return;
+
+        int kernel = svoPathTracing.FindKernel("CSMain");
+        if (kernel < 0)
+        {
+            Debug.LogError("[PathTracing] 计算着色器找不到 CSMain kernel");
+            return;
+        }
+
+        // 创建或重建 RT
+        bool resolutionChanged = false;
+        if (pathTracingRT == null || pathTracingRT.width != w || pathTracingRT.height != h)
+        {
+            resolutionChanged = true;
+            if (pathTracingRT != null) { pathTracingRT.Release(); Destroy(pathTracingRT); }
+            pathTracingRT = new RenderTexture(w, h, 0, RenderTextureFormat.ARGBFloat);
+            pathTracingRT.enableRandomWrite = true;
+            pathTracingRT.name = "PathTracing_RT";
+            pathTracingRT.Create();
+        }
+
+        // 检测相机是否移动（移动时重置累积）
+        Matrix4x4 currentView = cam.worldToCameraMatrix;
+        Matrix4x4 currentProj = cam.projectionMatrix;
+        bool cameraMoved = (pathTracingFrameCount > 0) &&
+            (currentView != prevViewMatrix || currentProj != prevProjMatrix);
+
+        if (cameraMoved || resolutionChanged)
+        {
+            pathTracingFrameCount = 0;
+            // 清空 RT 以移除旧帧数据
+            Graphics.SetRenderTarget(pathTracingRT);
+            GL.Clear(false, true, Color.black);
+        }
+
+        prevViewMatrix = currentView;
+        prevProjMatrix = currentProj;
+
+        try
+        {
+            Matrix4x4 vp = GL.GetGPUProjectionMatrix(cam.projectionMatrix, false) * cam.worldToCameraMatrix;
+            svoPathTracing.SetMatrix("_InverseVP", vp.inverse);
+            svoPathTracing.SetVector("_CameraPos", cam.transform.position);
+            svoPathTracing.SetTexture(kernel, "_PathTracingResult", pathTracingRT);
+
+            // 天空盒
+            Vector3 skyColor = new Vector3(1.5f, 2.0f, 3.0f); // HDR 回退天空色（确保无 Cubemap 时仍有足够亮度）
+            Cubemap skyCubemap = null;
+            var skybox = cam.GetComponent<Skybox>();
+            if (skybox != null && skybox.material != null && skybox.material.HasProperty("_Tex"))
+                skyCubemap = skybox.material.GetTexture("_Tex") as Cubemap;
+            if (skyCubemap == null && RenderSettings.skybox != null && RenderSettings.skybox.HasProperty("_Tex"))
+                skyCubemap = RenderSettings.skybox.GetTexture("_Tex") as Cubemap;
+            if (skyCubemap != null)
+            {
+                svoPathTracing.SetTexture(kernel, "_SkyboxTex", skyCubemap);
+                svoPathTracing.SetFloat("_HasSkyCube", 1.0f);
+            }
+            else
+            {
+                svoPathTracing.SetFloat("_HasSkyCube", 0.0f);
+            }
+            svoPathTracing.SetVector("_SkyColor", skyColor);
+
+            // 路径追踪参数
+            svoPathTracing.SetInt("_MaxDepth", maxBounceDepth);
+            svoPathTracing.SetInt("_FrameCount", pathTracingFrameCount);
+
+            uint tgX, tgY, tgZ;
+            svoPathTracing.GetKernelThreadGroupSizes(kernel, out tgX, out tgY, out tgZ);
+            svoPathTracing.Dispatch(kernel, Mathf.CeilToInt(w / (float)tgX), Mathf.CeilToInt(h / (float)tgY), 1);
+
+            pathTracingFrameCount++;
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogError($"[PathTracing] 计算着色器调度失败: {ex.Message}");
         }
     }
 

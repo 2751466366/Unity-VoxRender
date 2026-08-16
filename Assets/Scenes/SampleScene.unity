@@ -371,7 +371,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 32abb53eab4f04d42944f04f09f3689e, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  moveSpeed: 10
+  moveSpeed: 100
   sprintMultiplier: 2
   mouseSensitivity: 2
   requireRightClick: 1
@@ -388,9 +388,11 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   ambient: 0.2
-  debugView: 5
+  debugView: 6
   svoRayCast: {fileID: 7200000, guid: b0dcbd8cf0fe0274f9c3331883e5307f, type: 3}
   svoRayTracing: {fileID: 7200000, guid: a7f3e2b1c9d4846e8a5f10c2d3e67b94, type: 3}
+  svoPathTracing: {fileID: 7200000, guid: 408e275a38cb6894c88c9ebaf9b44fe1, type: 3}
+  maxBounceDepth: 2
 --- !u!1 &1171443738
 GameObject:
   m_ObjectHideFlags: 0
