@@ -110,6 +110,15 @@ float SchlickFresnel(float F0, float cosTheta)
     return F0 + (1.0f - F0) * pow(1.0f - max(cosTheta, 0.0f), 5.0f);
 }
 
+// Smith G1 for GGX（可见性项）
+float SmithG1_GGX(float3 w, float3 N, float roughness)
+{
+    float a2 = roughness * roughness * roughness * roughness;
+    float cosTheta = max(0.0, dot(w, N));
+    float sinTheta2 = 1.0f - cosTheta * cosTheta;
+    return 2.0f / (1.0f + sqrt(1.0f + a2 * sinTheta2 / max(cosTheta * cosTheta, 1e-7f)));
+}
+
 // ============================================================
 //  SVO 查找：给定网格空间整数坐标，返回叶子节点的 materialIndex
 // ============================================================
@@ -286,13 +295,12 @@ int TraverseSVO_DDA(float3 ro, float3 rd,
 }
 
 // ============================================================
-//  网格空间法线 → 世界空间法线（Y/Z 交换）
+//  网格空间方向 → 世界空间方向
+//  SVO 网格空间 = 世界空间（仅平移+缩放），坐标轴方向一致，无需交换
 // ============================================================
-float3 GridNormalToWorld(float3 gridN)
+float3 GridDirToWorld(float3 gridD)
 {
-    // 网格空间与世界空间存在 Y/Z 交换（VoxDataProvider LocalPosMinToCubeLocal）
-    // Vox Y → Unity Z, Vox Z → Unity Y
-    return normalize(float3(gridN.x, gridN.z, gridN.y));
+    return normalize(gridD);
 }
 
 // ============================================================
@@ -422,7 +430,7 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed)
             // 法线在网格空间构建 TBN 帧，确保采样分布正确
             float3 NGrid = normalize(hitNGrid);
             newDirGrid = SampleDiffuse(NGrid, seed);
-            newDirWorld = GridNormalToWorld(newDirGrid);
+            newDirWorld = GridDirToWorld(newDirGrid);
             throughput *= mat.color;
         }
         else if (abs(mat.type - 1.0f) < 0.5f) // Metal
@@ -438,12 +446,16 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed)
             if (ndotwr > 0.0f)
             {
                 newDirGrid = normalize(wrGrid);
-                newDirWorld = GridNormalToWorld(newDirGrid);
+                newDirWorld = GridDirToWorld(newDirGrid);
 
                 float F0 = mat.spec;
                 float cosTheta = max(0.0, dot(H, woGrid));
                 float F = SchlickFresnel(F0, cosTheta);
-                throughput *= mat.color * F;
+
+                // PDF 修正：BSDF/pdf = F * G1(wi) / G1(wo)
+                float G1_wi = SmithG1_GGX(woGrid, NGrid, mat.rough);
+                float G1_wr = SmithG1_GGX(wrGrid, NGrid, mat.rough);
+                throughput *= mat.color * F * (G1_wi / max(G1_wr, 1e-6f));
             }
             else
             {
@@ -463,9 +475,10 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed)
 
             if (rand(seed) < F)
             {
+                // ---- 反射（delta 分布，BSDF/pdf = 1，RR 概率 F 恰好约掉）----
                 float3 wrGrid = reflect(-woGrid, NGrid);
                 newDirGrid = normalize(wrGrid);
-                newDirWorld = GridNormalToWorld(newDirGrid);
+                newDirWorld = GridDirToWorld(newDirGrid);
                 throughput *= mat.color;
             }
             else
@@ -473,15 +486,17 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed)
                 float3 wtGrid = refract(-woGrid, NGrid, eta);
                 if (length(wtGrid) < 0.001f)
                 {
+                    // 全内反射回退（同反射分支）
                     float3 wrGrid = reflect(-woGrid, NGrid);
                     newDirGrid = normalize(wrGrid);
-                    newDirWorld = GridNormalToWorld(newDirGrid);
+                    newDirWorld = GridDirToWorld(newDirGrid);
                     throughput *= mat.color;
                 }
                 else
                 {
+                    // ---- 折射（delta 分布，BSDF/pdf 含 eta^2 恰好与 RR 概率约掉）----
                     newDirGrid = normalize(wtGrid);
-                    newDirWorld = GridNormalToWorld(newDirGrid);
+                    newDirWorld = GridDirToWorld(newDirGrid);
                     isInside = !isInside;
                     throughput *= mat.color;
                 }
@@ -491,7 +506,7 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed)
         {
             float3 NGrid = normalize(hitNGrid);
             newDirGrid = SampleDiffuse(NGrid, seed);
-            newDirWorld = GridNormalToWorld(newDirGrid);
+            newDirWorld = GridDirToWorld(newDirGrid);
             throughput *= mat.color;
         }
 
@@ -499,7 +514,8 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed)
             break;
 
         // ---- 设置下一弹射线 ----
-        float3 hitPosGrid = float3(hitVoxel) + 0.5;
+        // 使用 DDA 精确命中点（保留空间连续性），而非体素中心
+        float3 hitPosGrid = roGrid + rdGrid * hitT;
         // 逃逸偏移：沿弹射方向精确计算到当前体素边界的距离
         // 正分量→从上边界逃逸，负分量→从下边界逃逸，零分量→用法线兜底
         float3 escapeDist;

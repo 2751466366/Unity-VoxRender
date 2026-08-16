@@ -371,12 +371,11 @@ bool ShadowRayHit_DDA(float3 ro, float3 rd, int3 skipVoxel)
 // ============================================================
 //  网格空间法线 → 世界空间法线
 //  SVO 坐标空间: world = grid * _SVOScale + _SVORootMin
-//  仅有均匀缩放 + VOX→Unity Y/Z 交换，无旋转
-//  缩放不影响法线方向，只需做 Y/Z 交换
+//  SVO 网格空间 = 世界空间（仅平移+缩放），坐标轴方向一致，无需交换
 // ============================================================
-float3 GridNormalToWorld(float3 gridN)
+float3 GridDirToWorld(float3 gridD)
 {
-    return normalize(float3(gridN.x, gridN.z, gridN.y));
+    return normalize(gridD);
 }
 
 // ============================================================
@@ -429,7 +428,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     }
 
     // ---- 法线：网格空间 → 世界空间 ----
-    float3 worldNormal = GridNormalToWorld(hitNGrid);
+    float3 worldNormal = GridDirToWorld(hitNGrid);
 
     // ---- 阴影射线（DDA 版，精确起点，无浮点 bias） ----
     // 起点 = 命中体素中心（整数 + 0.5，精确表示，与相机距离无关）
