@@ -338,7 +338,7 @@ VoxelMaterial ReadMaterial(int matIndex)
     mat.ior    = slot1.x;
     mat.att    = slot1.y;
     mat.flux   = slot1.z;
-    mat.color  = pow(max(slot2.rgb, 0.0f), 1.0f / 2.2f); // gamma 校正
+    mat.color  = slot2.rgb;
     mat.alpha  = slot2.w;
 
     return mat;
@@ -551,10 +551,8 @@ float3 SamplePixel(float2 samplePos, float2 jitter, float2 imageSize,
 
     float3 result = PathTrace(ro, rd, seed);
 
-    // 萤火虫钳制
-    float lum = dot(result, float3(1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f));
-    if (lum > FIREFLY_THRESHOLD)
-        result *= FIREFLY_THRESHOLD / lum;
+    // 萤火虫软钳制（Reinhard 风格，平滑过渡无突变）
+    result = result / (1.0f + result / FIREFLY_THRESHOLD);
 
     return result;
 }

@@ -162,7 +162,11 @@ public class VoxDataProvider : MonoBehaviour
             if (voxFile.Palette != null && voxFile.Palette.Colors != null && i < voxFile.Palette.Colors.Length)
             {
                 var c = voxFile.Palette.Colors[i];
-                me.color = new Color(c.R / 255f, c.G / 255f, c.B / 255f, c.A / 255f);
+                me.color = new Color(
+                    Mathf.GammaToLinearSpace(c.R / 255f),
+                    Mathf.GammaToLinearSpace(c.G / 255f),
+                    Mathf.GammaToLinearSpace(c.B / 255f),
+                    c.A / 255f);
             }
             materialElements.Add(me);  // 添加到全局列表
         }
@@ -290,8 +294,10 @@ public class VoxDataProvider : MonoBehaviour
                 int iz = (int)voxel.LocalPosition.Z;
                 if (ix < 0 || ix >= sx || iy < 0 || iy >= sy || iz < 0 || iz >= sz) continue;
                 pixels[ix + iy * sx + iz * sx * sy] = new Color(
-                    voxel.Color.R / 255f, voxel.Color.G / 255f,
-                    voxel.Color.B / 255f, voxel.Color.A / 255f);
+                    Mathf.GammaToLinearSpace(voxel.Color.R / 255f),
+                    Mathf.GammaToLinearSpace(voxel.Color.G / 255f),
+                    Mathf.GammaToLinearSpace(voxel.Color.B / 255f),
+                    voxel.Color.A / 255f);
             }
             tex.SetPixels(pixels);
             tex.Apply(false, false);
