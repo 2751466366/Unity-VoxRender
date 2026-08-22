@@ -166,7 +166,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 039da382c5b1af1478f29389f7918d5b, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  voxFilePath: Assets/Scenes/Vox/castle.vox
+  voxFilePath: Assets/Scenes/Vox/castle-all.vox
   voxelScale: 1
   chunk3DMaterial: {fileID: 0}
   loadOnStart: 1
