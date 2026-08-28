@@ -3,7 +3,7 @@ using UnityEngine;
 using VoxReader.Interfaces;
 
 /// <summary>
-/// 集中管理 VOX 文件的解析、3D 纹理与 chunk 代理立方体的创建与存储。
+/// 集中管理 VOX 文件的解析、3D 纹理与体素数据的创建与存储。
 /// 外部脚本通过路径加载，获得一个 int 句柄（索引），再用句柄读取数据。
 /// 为后续 SVO 体素路径追踪等高级渲染提供统一的数据入口。
 /// </summary>
@@ -49,7 +49,7 @@ public class VoxDataProvider : MonoBehaviour
 
     /// <summary>
     /// 加载一个 VOX 文件，返回句柄（索引）。失败返回 -1。
-    /// parent 为 null 时立方体挂到本管理器下；scale/material 用默认值时取管理器配置。
+    /// scale/material 用默认值时取管理器配置。
     /// </summary>
     public int Load(string voxFilePath, Transform parent = null,
                     float scale = -1f, Material material = null)
@@ -231,15 +231,6 @@ public class VoxDataProvider : MonoBehaviour
         materialElements[slot] = me;
     }
 
-    // ---- 内部：最小角本地映射（不带 +0.5, 去掉中心偏移, Vox YZ） ----
-    static Vector3 LocalPosMinToCubeLocal(Vector3Int lp, Vector3Int d)
-    {
-        return new Vector3(
-            lp.x / (float)d.x - 0.5f,
-            lp.z / (float)d.z - 0.5f,   // Vox Y → Unity Z
-            lp.y / (float)d.y - 0.5f);  // Vox Z → Unity Y
-    }
-
     /// <summary>
     /// 四舍五入到最近的整数（round half up），避免 Unity RoundToInt 的银行家舍入问题。
     /// </summary>
@@ -251,7 +242,7 @@ public class VoxDataProvider : MonoBehaviour
             Mathf.FloorToInt(v.z + 0.5f));
     }
 
-    // ---- 内部：创建 chunk 立方体 + 3D 纹理 + voxelElements + ChunkInfo ----
+    // ---- 内部：创建 3D 纹理 + voxelElements + ChunkInfo ----
     bool CreateChunks(IVoxFile voxFile, VoxAsset asset, Transform parent,
                       float scale, Material baseMat)
     {
@@ -271,7 +262,7 @@ public class VoxDataProvider : MonoBehaviour
         int matBase = materialElements.Count;  // 记录当前资产的材质起始索引
         BuildMaterialElements(voxFile, asset, matBase);
 
-        // Phase B: 逐 model 创建 Texture3D + chunk cube + voxelElements + ChunkInfo
+        // Phase B: 逐 model 创建 Texture3D + voxelElements + ChunkInfo
         for (int i = 0; i < voxFile.Models.Length; i++)
         {
             var model = voxFile.Models[i];
@@ -303,71 +294,48 @@ public class VoxDataProvider : MonoBehaviour
             tex.Apply(false, false);
             asset.textures.Add(tex);
 
-            // ---- chunk 代理立方体 ----
-            GameObject cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            cube.name = $"Chunk_{model.Name}_m{model.Id}_{sx}x{sy}x{sz}";
-            cube.transform.SetParent(parent, false);
-
-            // 立方体用 LocalSize 做缩放，旋转通过 localRotation 应用
-            Vector3 chunkSize = new Vector3(sx, sz, sy) * scale; // Vox->Unity: Y<->Z
-            cube.transform.localScale = chunkSize;
-
-            // Vox 旋转矩阵 → Unity 四元数
+            // ---- Vox 变换参数 ----
             Quaternion rot = Matrix3ToQuaternion(model.GlobalRotation);
-            cube.transform.localRotation = rot;
+            Vector3 chunkMin = parent.position + VoxToUnityPosition(model.GlobalPosition) * scale; // chunk 最小角
+            Vector3 chunkSize = new Vector3(sx, sz, sy) * scale; // Vox->Unity: Y<->Z
 
-            // Vox 全局位置 → Unity 坐标
-            Vector3 localPos = VoxToUnityPosition(model.GlobalPosition) * scale;
-            if (model.GlobalPosition.X == 0 && model.GlobalPosition.Y == 0 && model.GlobalPosition.Z == 0)
-                localPos += chunkSize * 0.5f;
-            cube.transform.localPosition = localPos;
-
-            // ---- ChunkInfo: 用世界空间位置算 worldMin/worldMax ----
+            // ---- ChunkInfo ----
             var chunkInfo = new ChunkInfo();
             chunkInfo.dims = new Vector3Int(sx, sy, sz);
-            
-            // 用 cube 的世界位置（包含父对象变换）计算 AABB
-            Vector3 worldPos = cube.transform.position;
-            Vector3 h = rot * (chunkSize * 0.5f);
-            Vector3 worldHalf = new Vector3(Mathf.Abs(h.x), Mathf.Abs(h.y), Mathf.Abs(h.z));
-            chunkInfo.worldMin = worldPos - worldHalf;
-            chunkInfo.worldMax = worldPos + worldHalf;
-            chunkInfo.cube = cube;
+            Vector3 rotHalf = rot * (chunkSize * 0.5f);
+            chunkInfo.worldMin = chunkMin + Vector3.Min(rotHalf, -rotHalf);
+            chunkInfo.worldMax = chunkMin + Vector3.Max(rotHalf, -rotHalf);
 
-            // ---- 新增：写扁平 voxelElements (scene-space 整数最小角) ----
-            int voxelCountBefore = voxelElements.Count;
-            int filteredCount = 0;
+            // ---- 体素坐标计算（直接用 rot，不依赖 cube Transform） ----
             foreach (var voxel in model.Voxels)
             {
                 int ix = (int)voxel.LocalPosition.X;
                 int iy = (int)voxel.LocalPosition.Y;
                 int iz = (int)voxel.LocalPosition.Z;
                 if (ix < 0 || ix >= sx || iy < 0 || iy >= sy || iz < 0 || iz >= sz) 
-                {
-                    filteredCount++;
                     continue;
-                }
             
-                Vector3 cubeLocal = LocalPosMinToCubeLocal(new Vector3Int(ix, iy, iz), new Vector3Int(sx, sy, sz));
-                //cubeLocal = cubeLocal - new Vector3(0.5f, 0.5f, 0.5f);
-                Vector3 worldMinCorner = cube.transform.TransformPoint(cubeLocal);
-                Vector3Int sceneMinCorner = Vector3Int.FloorToInt(worldMinCorner / scale);
-                voxelElements.Add(new VoxelElement  // 添加到全局列表
+                // 体素相对于 chunk 中心的局部偏移（含 YZ 交换）
+                Vector3 localOffset = new Vector3(
+                    (ix - sx * 0.5f) * scale,
+                    (iz - sz * 0.5f) * scale,   // Vox Y → Unity Z
+                    (iy - sy * 0.5f) * scale);  // Vox Z → Unity Y
+                // 旋转后得到世界空间偏移，加上 chunk 最小角
+                Vector3 worldMinCorner = chunkMin + rot * localOffset;
+                Vector3Int sceneMinCorner = RoundToInt(worldMinCorner / scale);
+                voxelElements.Add(new VoxelElement
                 {
                     worldPos = sceneMinCorner,
-                    materialIndex = matBase + voxel.ColorIndex  // 加上材质偏移
+                    materialIndex = matBase + voxel.ColorIndex
                 });
             }
-            int addedCount = voxelElements.Count - voxelCountBefore;
-            Debug.Log($"[VoxDataProvider] Model '{model.Name}': 原始体素={model.Voxels.Length}, 添加={addedCount}, 过滤={filteredCount}");
 
-            // ---- 材质实例（每 chunk 一个，绑定纹理与尺寸） ----
+            // ---- 材质实例 ----
             var instMat = new Material(baseMat);
-            instMat.name = $"Mat_{cube.name}";
+            instMat.name = $"Mat_{model.Name}_m{model.Id}";
             instMat.SetTexture("_VoxelTexture", tex);
             instMat.SetVector("_ChunkSize", new Vector4(sx, sy, sz, 0));
             instMat.SetFloat("_VoxelScale", scale);
-            cube.GetComponent<Renderer>().sharedMaterial = instMat;
             asset.materials.Add(instMat);
             asset.chunks.Add(chunkInfo);
         }
@@ -377,40 +345,7 @@ public class VoxDataProvider : MonoBehaviour
         return true;
     }
 
-    /// <summary>计算 cube 世界空间 AABB 并写入材质的 _WorldBoxMin/_WorldBoxMax。</summary>
-    static void UpdateWorldAABB(GameObject cube, Material mat)
-    {
-        Vector3 min = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
-        Vector3 max = new Vector3(float.MinValue, float.MinValue, float.MinValue);
-        for (int i = 0; i < 8; i++)
-        {
-            Vector3 corner = new Vector3(
-                (i & 1) == 0 ? -0.5f : 0.5f,
-                (i & 2) == 0 ? -0.5f : 0.5f,
-                (i & 4) == 0 ? -0.5f : 0.5f
-            );
-            Vector3 wc = cube.transform.TransformPoint(corner);
-            min = Vector3.Min(min, wc);
-            max = Vector3.Max(max, wc);
-        }
-        mat.SetVector("_WorldBoxMin", new Vector4(min.x, min.y, min.z, 0));
-        mat.SetVector("_WorldBoxMax", new Vector4(max.x, max.y, max.z, 0));
-    }
 
-    void Update()
-    {
-        // 动态更新所有活跃 chunk 的世界 AABB（物体移动/旋转后保持正确）
-        foreach (var asset in assets)
-        {
-            if (asset == null || !asset.isActive) continue;
-            for (int i = 0; i < asset.chunks.Count; i++)
-            {
-                var chunk = asset.chunks[i];
-                if (chunk != null && chunk.cube != null && i < asset.materials.Count && asset.materials[i] != null)
-                    UpdateWorldAABB(chunk.cube, asset.materials[i]);
-            }
-        }
-    }
 
     static Vector3 VoxToUnityPosition(VoxReader.Vector3 v) => new Vector3(v.X, v.Z, v.Y);
 
@@ -458,17 +393,9 @@ public class VoxAsset
     /// <summary>标记资产是否有效。Dispose 后置为 false，参与序列化以跨重编译保持。</summary>
     public bool isActive = true;
 
-    /// <summary>销毁所有关联的 Unity 资源（立方体/材质/纹理）。</summary>
+    /// <summary>销毁所有关联的 Unity 资源（材质/纹理）。</summary>
     public void Dispose()
     {
-        foreach (var chunk in chunks)
-        {
-            if (chunk?.cube != null)
-            {
-                chunk.cube.SetActive(false);
-                UnityEngine.Object.DestroyImmediate(chunk.cube);
-            }
-        }
         foreach (var m in materials)
             if (m != null) DestroyUnityObj(m);
         foreach (var t in textures)

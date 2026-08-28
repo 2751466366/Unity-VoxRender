@@ -286,15 +286,10 @@ public class CameraRender : MonoBehaviour
             for (int i = 0; i < asset.chunks.Count; i++)
             {
                 var chunk = asset.chunks[i];
-                var cube = chunk != null ? chunk.cube : null;
+                // TODO: 延迟渲染改为 SVO 输出 G-buffer 后移除 cube 依赖
+                // var cube = chunk != null ? chunk.cube : null;
                 var mat  = i < asset.materials.Count ? asset.materials[i] : null;
-                if (cube == null || mat == null) continue;
-
-                var mf = cube.GetComponent<MeshFilter>();
-                if (mf == null || mf.sharedMesh == null) continue;
-
-                // DrawMesh 不依赖 Renderer 是否启用，直接用 mesh + matrix + material 绘制
-                gBufferCmd.DrawMesh(mf.sharedMesh, cube.transform.localToWorldMatrix, mat, 0, 0);
+                if (mat == null) continue;
             }
         }
     }
@@ -490,9 +485,10 @@ public class CameraRender : MonoBehaviour
             if (asset == null || !asset.isActive) continue;
             foreach (var chunk in asset.chunks)
             {
-                if (chunk?.cube == null) continue;
-                var renderer = chunk.cube.GetComponent<MeshRenderer>();
-                if (renderer != null) renderer.enabled = enabled;
+                // TODO: 延迟渲染改为 SVO 输出 G-buffer 后移除
+                // if (chunk?.cube == null) continue;
+                // var renderer = chunk.cube.GetComponent<MeshRenderer>();
+                // if (renderer != null) renderer.enabled = enabled;
             }
         }
     }

@@ -62,6 +62,19 @@ public class VoxModel : MonoBehaviour
             return;
         }
 
+        // SVO 需要整数对齐：强制 parent 位置为整数坐标，确保 cube 边界对齐到整数
+        Vector3 parentPos = transform.position;
+        Vector3Int intPos = new Vector3Int(
+            Mathf.RoundToInt(parentPos.x),
+            Mathf.RoundToInt(parentPos.y),
+            Mathf.RoundToInt(parentPos.z));
+        
+        if (parentPos != (Vector3)intPos)
+        {
+            Debug.LogWarning($"[VoxModel] Parent 位置 {parentPos} 不是整数，已修正为 {intPos}（SVO 需要整数对齐）");
+            transform.position = intPos;
+        }
+
         handle = provider.Load(voxFilePath, transform, voxelScale, chunk3DMaterial);
     }
 

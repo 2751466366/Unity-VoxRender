@@ -411,13 +411,6 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed)
             return radiance;
         }
 
-        // ---- 确保法线朝外 ----
-        // DDA 返回的法线指向射线来源方向：
-        //   外部命中：法线与 rdGrid 同向（都指向体素内部）→ 需要翻转
-        //   内部命中：法线与 rdGrid 反向（指向体素外部）→ 已正确，不翻转
-        if (dot(hitNGrid, rdGrid) > 0.0f)
-            hitNGrid = -hitNGrid;
-
         // ---- BSDF 采样：确定下一弹射方向 ----
         // 所有采样在网格空间完成（与 DDA 遍历一致），
         // 最后转换到世界空间供 SampleSky 使用。
@@ -518,11 +511,7 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed)
         float3 hitPosGrid = roGrid + rdGrid * hitT;
         // 逃逸偏移：沿弹射方向精确计算到当前体素边界的距离
         // 正分量→从上边界逃逸，负分量→从下边界逃逸，零分量→用法线兜底
-        float3 escapeDist;
-        escapeDist.x = abs(newDirGrid.x) > EPSILON ? (newDirGrid.x > 0 ? (1.0 - hitPosGrid.x % 1.0) : (hitPosGrid.x % 1.0)) / abs(newDirGrid.x) : abs(hitNGrid.x) * 0.5;
-        escapeDist.y = abs(newDirGrid.y) > EPSILON ? (newDirGrid.y > 0 ? (1.0 - hitPosGrid.y % 1.0) : (hitPosGrid.y % 1.0)) / abs(newDirGrid.y) : abs(hitNGrid.y) * 0.5;
-        escapeDist.z = abs(newDirGrid.z) > EPSILON ? (newDirGrid.z > 0 ? (1.0 - hitPosGrid.z % 1.0) : (hitPosGrid.z % 1.0)) / abs(newDirGrid.z) : abs(hitNGrid.z) * 0.5;
-        roGrid = hitPosGrid + newDirGrid * (max(max(escapeDist.x, escapeDist.y), escapeDist.z) + 0.01f);
+        roGrid = hitPosGrid + newDirGrid * 0.01f;
         rdGrid = newDirGrid;
         rdWorld = newDirWorld;
 

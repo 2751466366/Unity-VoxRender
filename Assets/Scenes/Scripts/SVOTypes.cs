@@ -65,7 +65,6 @@ public struct SVONode
 [System.Serializable]
 public class ChunkInfo
 {
-    public GameObject cube;
     public Vector3Int dims;                    // Vox 空间 (sx, sy, sz)
-    public Vector3 worldMin, worldMax;         // 旋转后的世界 AABB (§3.1 一次性算好)
+    public Vector3 worldMin, worldMax;         // 旋转后的世界 AABB
 }
