@@ -24,7 +24,7 @@ public enum MaterialType { Diffuse, Metal, Glass, Emissive, Cloud, Blend }
 [StructLayout(LayoutKind.Explicit, Size = 48)] // 3×float4, GPU 对齐
 public struct MaterialElement
 {
-    [FieldOffset(0)]  public MaterialType type;
+    [FieldOffset(0)]  public float type;      // 0=Diffuse, 1=Metal, 2=Glass, 3=Emissive, 4=Cloud, 5=Blend
     [FieldOffset(4)]  public float weight, rough, spec;
     [FieldOffset(16)] public float ior, att, flux, _pad0;
     [FieldOffset(32)] public Color color;     // palette RGBA (A=透明度)

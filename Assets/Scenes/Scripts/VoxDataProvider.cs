@@ -31,6 +31,9 @@ public class VoxDataProvider : MonoBehaviour
     [System.NonSerialized] public List<VoxelElement>    voxelElements    = new List<VoxelElement>();
     [System.NonSerialized] public List<MaterialElement> materialElements = new List<MaterialElement>();
 
+    // remapped ColorIndex → raw palette index（从 IMAP chunk 构建）
+    int[] colorIndexFwdMap;
+
     void Awake()
     {
         if (Instance != null && Instance != this)
@@ -155,20 +158,40 @@ public class VoxDataProvider : MonoBehaviour
     // ---- 内部：构建材质表（自解析 MATL chunk 原始字节） ----
     void BuildMaterialElements(IVoxFile voxFile, VoxAsset asset, int matBase)
     {
-        // Phase A: 用 palette 为 256 槽填默认 Diffuse
+        // Phase A: 用 RAW palette 为 256 槽填默认 Diffuse
+        // 统一使用 raw 空间：RawColors[k] 对应 raw palette index k（0-based，k=0 为空）
+        // 这样与 MATL id（raw 空间）和体素 raw color index 对齐
+        
+        // 构建 forward map: remapped ColorIndex → raw palette index（从 IMAP chunk）
+        colorIndexFwdMap = new int[256];
+        for (int i = 0; i < 256; i++) colorIndexFwdMap[i] = i; // 默认无映射
+        if (voxFile.Chunks != null)
+        {
+            foreach (var chunk in voxFile.Chunks)
+            {
+                if (chunk != null && chunk.Type == VoxReader.ChunkType.IndexMap && chunk.Content != null && chunk.Content.Length >= 256)
+                {
+                    // IMAP[display_pos] = raw_palette_index (1-based)
+                    for (int i = 0; i < 256; i++)
+                        colorIndexFwdMap[i] = chunk.Content[i] - 1; // → 0-based raw index
+                    break;
+                }
+            }
+        }
+        
         for (int i = 0; i < 256; i++)
         {
-            var me = new MaterialElement { type = MaterialType.Diffuse };
-            if (voxFile.Palette != null && voxFile.Palette.Colors != null && i < voxFile.Palette.Colors.Length)
+            var me = new MaterialElement { type = 0f }; // 0=Diffuse
+            if (voxFile.Palette != null && voxFile.Palette.RawColors != null && i < voxFile.Palette.RawColors.Length)
             {
-                var c = voxFile.Palette.Colors[i];
+                var c = voxFile.Palette.RawColors[i];
                 me.color = new Color(
                     Mathf.GammaToLinearSpace(c.R / 255f),
                     Mathf.GammaToLinearSpace(c.G / 255f),
                     Mathf.GammaToLinearSpace(c.B / 255f),
                     c.A / 255f);
             }
-            materialElements.Add(me);  // 添加到全局列表
+            materialElements.Add(me);
         }
     
         // Phase B: 遍历递归找 MaterialNew chunk，自解析覆盖
@@ -195,7 +218,8 @@ public class VoxDataProvider : MonoBehaviour
     {
         int offset = 0;
         int id = System.BitConverter.ToInt32(content, offset); offset += 4;
-        int slot = matBase + id - 1; // MATL id 1-based → 全局 0-based
+        // MATL id 是 raw palette index（1-based），转为 0-based slot
+        int slot = matBase + id - 1;
         if (slot < 0 || slot >= materialElements.Count) return;
     
         int pairCount = System.BitConverter.ToInt32(content, offset); offset += 4;
@@ -217,7 +241,23 @@ public class VoxDataProvider : MonoBehaviour
             switch (key)
             {
                 case "_type":
-                    int mt; if (int.TryParse(val, out mt)) me.type = (MaterialType)mt;
+                    // MagicaVoxel 存的是字符串（"_emit"/"_metal"/"_glass"/"_diffuse"），不是数字
+                    switch (val)
+                    {
+                        case "_emit":   me.type = 3f; break;   // Emissive
+                        case "_metal":  me.type = 1f; break;   // Metal
+                        case "_glass":  me.type = 2f; break;   // Glass
+                        case "_diffuse": me.type = 0f; break;  // Diffuse
+                        case "_cloud":  me.type = 4f; break;   // Cloud
+                        case "_blend":  me.type = 5f; break;   // Blend
+                        default:
+                            float mt; if (float.TryParse(val, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out mt)) me.type = mt;
+                            break;
+                    }
+                    break;
+                case "_emit":
+                    // MagicaVoxel 用 _emit=1 标记发光（配合 _type="_emit"）
+                    if (val == "1") me.type = 3f; // Emissive
                     break;
                 case "_weight": float w; if (float.TryParse(val, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out w)) me.weight = w; break;
                 case "_rough":  float r; if (float.TryParse(val, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out r)) me.rough  = r; break;
@@ -307,6 +347,7 @@ public class VoxDataProvider : MonoBehaviour
             chunkInfo.worldMax = chunkMin + Vector3.Max(rotHalf, -rotHalf);
 
             // ---- 体素坐标计算（直接用 rot，不依赖 cube Transform） ----
+            int minCI = int.MaxValue, maxCI = int.MinValue;
             foreach (var voxel in model.Voxels)
             {
                 int ix = (int)voxel.LocalPosition.X;
@@ -323,11 +364,14 @@ public class VoxDataProvider : MonoBehaviour
                 // 旋转后得到世界空间偏移，加上 chunk 最小角
                 Vector3 worldMinCorner = chunkMin + rot * localOffset;
                 Vector3Int sceneMinCorner = RoundToInt(worldMinCorner / scale);
+                int rawColorIndex = colorIndexFwdMap[voxel.ColorIndex]; // remapped → raw
                 voxelElements.Add(new VoxelElement
                 {
                     worldPos = sceneMinCorner,
-                    materialIndex = matBase + voxel.ColorIndex
+                    materialIndex = matBase + rawColorIndex
                 });
+                if (rawColorIndex < minCI) minCI = rawColorIndex;
+                if (rawColorIndex > maxCI) maxCI = rawColorIndex;
             }
 
             // ---- 材质实例 ----
