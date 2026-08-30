@@ -22,6 +22,12 @@
 StructuredBuffer<uint4>   _SVONodes;       // childMask, data, flags, _pad
 StructuredBuffer<float4>  _SVOMaterials;   // 每 3 个 float4 一项 (48B)
 
+// ---- 自发光体素光源（SVOBuilder 构建，NEE 采样用）----
+StructuredBuffer<float4>  _EmissiveLights;       // xyz=grid coord (int as float), w=matIndex
+StructuredBuffer<float2>  _EmissiveAliasTable;   // alias table: x=prob, y=alias
+int                       _EmissiveLightCount;
+float                     _EmissiveTotalPower;   // sum(pow(2,flux)*lum(color)) 不含 scale²
+
 float3 _SVORootMin;   // 根节点最小角（世界空间）
 float  _SVOScale;     // 体素缩放
 int    _SVODepth;     // 八叉树深度
@@ -372,8 +378,9 @@ struct DirectLight
 // ============================================================
 //  NEE — 阴影射线可见性测试（轻量 DDA）
 //  从体素中心出发，skipVoxel 机制性防自遮挡
+//  maxT: 最大检测距离（HDR 环境光 = INFINITE，自发光体素 = 到光源距离）
 // ============================================================
-bool ShadowRayVisible(float3 roGrid, float3 lightDirGrid, int3 skipVoxel)
+bool ShadowRayVisible(float3 roGrid, float3 lightDirGrid, int3 skipVoxel, float maxT)
 {
     float rootSide = exp2((float)_SVODepth);
 
@@ -432,6 +439,11 @@ bool ShadowRayVisible(float3 roGrid, float3 lightDirGrid, int3 skipVoxel)
             else
             { currentVoxel.z += stepDir.z; tMax.z += tDelta.z; }
         }
+
+        // 超过最大检测距离 → 光源可见（未被遮挡）
+        float tNext = min(min(tMax.x, tMax.y), tMax.z);
+        if (tNext > maxT)
+            return true;
 
         if (any(currentVoxel < 0) || any(currentVoxel >= rootSide))
             return true;  // 离开 SVO → 可见天空
@@ -509,6 +521,74 @@ float EnvironmentLightPDF(float3 N, float3 dir)
 }
 
 // ============================================================
+//  NEE — 自发光体素 alias table 采样
+//  按功率加权随机选取一个发光体素，返回索引
+// ============================================================
+uint SampleEmissiveAlias(inout uint seed)
+{
+    uint n = (uint)_EmissiveLightCount;
+    if (n <= 1u) return 0u;
+    float r1 = rand(seed);
+    float r2 = rand(seed);
+    uint idx = min((uint)(r1 * n), n - 1u);
+    float2 entry = _EmissiveAliasTable[idx];
+    return (r2 < entry.x) ? idx : (uint)entry.y;
+}
+
+// ============================================================
+//  NEE — 自发光体素采样
+//  从 alias table 按功率加权选一个发光体素，计算方向/距离/辐射度
+//  返回 false = 超出距离或无效
+// ============================================================
+bool SampleEmissiveLight(float3 hitPosGrid, float3 NGrid,
+                         inout uint seed, out DirectLight directLight)
+{
+    directLight.pdf = 0.0;
+    directLight.distance = 0.0;
+    directLight.radianceOverPdf = float3(0, 0, 0);
+    directLight.direction = float3(0, 1, 0);
+
+    if (_EmissiveLightCount <= 0 || _EmissiveTotalPower <= 0.0)
+        return false;
+
+    // 1. alias table 采样一个发光体素
+    uint idx = SampleEmissiveAlias(seed);
+    float4 lightData = _EmissiveLights[idx];
+
+    // 2. 网格坐标 → 世界坐标中心
+    float3 lightCenterWorld = (float3(lightData.xyz) + 0.5) * _SVOScale + _SVORootMin;
+    float3 hitPosWorld = hitPosGrid * _SVOScale + _SVORootMin;
+
+    // 3. 方向和距离
+    float3 toLight = lightCenterWorld - hitPosWorld;
+    float distWorld = length(toLight);
+    if (distWorld < 1e-4f) return false;
+
+    // 距离筛选（世界空间 100 单位）
+    if (distWorld > 100.0f) return false;
+
+    float3 lightDir = toLight / distWorld;
+
+    // 法线半球检查
+    if (dot(NGrid, lightDir) <= 0.0f) return false;
+
+    // 4. 读取发光材质
+    int matIdx = asint(lightData.w);
+    VoxelMaterial emMat = ReadMaterial(matIdx);
+    float3 emColor = pow(2.0f, emMat.flux) * emMat.color;
+
+    // 5. radiance / discretePDF = color * totalPower（alias table 功率加权）
+    //    d_grid² = d_world² / scale²，最终贡献中 scale² 正确抵消
+    float distGrid2 = distWorld * distWorld / (_SVOScale * _SVOScale);
+    directLight.radianceOverPdf = emColor * _EmissiveTotalPower / distGrid2;
+    directLight.direction = lightDir;
+    directLight.distance = distWorld;
+    directLight.pdf = 1.0f;  // delta 光源，MIS weight = 1.0
+
+    return true;
+}
+
+// ============================================================
 //  NEE — 环境光采样（余弦半球 + Cubemap 查询）
 //  当前阶段用余弦加权采样，未来升级为等距柱状投影重要性采样
 // ============================================================
@@ -525,7 +605,7 @@ float3 SampleEnvironmentLight(float3 NGrid, inout uint seed,
 
 // ============================================================
 //  NEE — 统一光源采样入口
-//  当前仅 HDR 环境光；未来扩展点光/方向光/自发光体素只需在此添加分支
+//  HDR 环境光 + 自发光体素，one-sample MIS 混合
 // ============================================================
 void SampleLights(float3 hitPosGrid, float3 NGrid, float3 woGrid,
                   inout uint seed, out DirectLight directLight)
@@ -535,21 +615,36 @@ void SampleLights(float3 hitPosGrid, float3 NGrid, float3 woGrid,
     directLight.radianceOverPdf = float3(0, 0, 0);
     directLight.direction = float3(0, 1, 0);
 
-    if (_HasSkyCube > 0.5f)
+    float envWeight = (_HasSkyCube > 0.5f) ? 0.5f : 0.0f;
+    float emWeight  = (_EmissiveLightCount > 0) ? 0.5f : 0.0f;
+    float totalW = envWeight + emWeight;
+    if (totalW < 1e-6f) return;
+
+    // 按权重随机选择一种光源采样（one-sample MIS）
+    bool sampleEnv = (rand(seed) * totalW < envWeight);
+
+    if (sampleEnv && _HasSkyCube > 0.5f)
     {
+        // ---- HDR 环境光采样 ----
         float3 lightDirGrid;
         float  envPDF;
         float3 radianceOverPdf = SampleEnvironmentLight(NGrid, seed, lightDirGrid, envPDF);
 
         directLight.direction = lightDirGrid;
-        directLight.pdf = envPDF;
+        directLight.pdf = envPDF * (envWeight / totalW);
         directLight.radianceOverPdf = radianceOverPdf;
+        // distance 保持 INFINITE
     }
-
-    // 未来扩展：
-    // float lightWeight = (_LightCount > 0) ? 0.5 : 0.0;
-    // float envWeight   = (_HasSkyCube > 0.5f) ? 0.5 : 0.0;
-    // 按权重随机选一种光源采样，MIS 自动平衡
+    else if (_EmissiveLightCount > 0)
+    {
+        // ---- 自发光体素采样 ----
+        DirectLight emLight;
+        if (SampleEmissiveLight(hitPosGrid, NGrid, seed, emLight))
+        {
+            directLight = emLight;
+            directLight.pdf = emLight.pdf * (emWeight / totalW);
+        }
+    }
 }
 
 // ============================================================
@@ -659,8 +754,9 @@ void SampleBSDF(VoxelMaterial mat, float3 hitNGrid, float3 rdGrid,
 //         c. BSDF sample → 新方向 + throughput 更新 + PDF 记录
 //         d. 俄罗斯轮盘赌 → 概率终止
 // ============================================================
-float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed)
+float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed, out bool hitSky)
 {
+    hitSky = false;
     float3 radiance   = float3(0, 0, 0);
     float3 throughput = float3(1, 1, 1);
     bool   isInside   = false;
@@ -687,6 +783,7 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed)
 
             if (firstRay)
             {
+                hitSky = true;
                 return skyCol;  // 首射线无 MIS
             }
 
@@ -742,7 +839,8 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed)
 
                     // 5. 阴影射线可见性（从体素中心出发，跳过命中体素）
                     float3 shadowRo = float3(hitVoxel) + 0.5;
-                    bool visible = ShadowRayVisible(shadowRo, directLight.direction, hitVoxel);
+                    //float3 shadowRo = roGrid + rdGrid * hitT;
+                    bool visible = ShadowRayVisible(shadowRo, directLight.direction, hitVoxel, directLight.distance);
 
                     if (visible)
                     {
@@ -798,15 +896,18 @@ float3 SamplePixel(float2 samplePos, float2 jitter, float2 imageSize,
     float3 rd = normalize(farWorld.xyz - _CameraPos);
     float3 ro = _CameraPos;
 
-    float3 result = PathTrace(ro, rd, seed);
+    bool hitSky;
+    float3 result = PathTrace(ro, rd, seed, hitSky);
 
-    // 萤火虫抑制（无分支 Reinhard 软钳制）
-    // lum ≤ T: 线性通过；lum > T: 平滑压缩，阈值处减半，渐进趋近 2T
-    float lum = dot(result, float3(0.2126, 0.7152, 0.0722));
-    float fireflyMask = step(FIREFLY_THRESHOLD, lum);
-    float clampedLum = lum * (1.0 - fireflyMask)
-                     + (FIREFLY_THRESHOLD - FIREFLY_THRESHOLD * FIREFLY_THRESHOLD / (lum + 1e-6)) * fireflyMask;
-    result *= clampedLum / max(lum, 1e-6);
+    // 萤火虫抑制：仅对命中几何体的路径钳制，纯天空射线不钳制
+    if (!hitSky)
+    {
+        float lum = dot(result, float3(0.2126, 0.7152, 0.0722));
+        float fireflyMask = step(FIREFLY_THRESHOLD, lum);
+        float clampedLum = lum * (1.0 - fireflyMask)
+                         + (FIREFLY_THRESHOLD - FIREFLY_THRESHOLD * FIREFLY_THRESHOLD / (lum + 1e-6)) * fireflyMask;
+        result *= clampedLum / max(lum, 1e-6);
+    }
 
     return result;
 }

@@ -16,12 +16,16 @@ public static class SVOBuilder
     // ---- GPU buffer 引用，供外部释放 ----
     private static ComputeBuffer sNodeBuf;
     private static ComputeBuffer sMatBuf;
+    private static ComputeBuffer sEmissiveBuf;
+    private static ComputeBuffer sAliasBuf;
 
     /// <summary>释放上一次 Build 创建的 ComputeBuffer。</summary>
     public static void Release()
     {
         if (sNodeBuf != null) { sNodeBuf.Release(); sNodeBuf = null; }
         if (sMatBuf  != null) { sMatBuf.Release();  sMatBuf = null; }
+        if (sEmissiveBuf != null) { sEmissiveBuf.Release(); sEmissiveBuf = null; }
+        if (sAliasBuf    != null) { sAliasBuf.Release();    sAliasBuf = null; }
     }
 
     /// <summary>
@@ -120,6 +124,71 @@ public static class SVOBuilder
         Shader.SetGlobalInt   ("_SVODepth",     depth);
 
         Debug.Log($"[SVOBuilder] Phase 3: GPU 上传完成 — nodes={pool.Count}, materials={provider.materialElements.Count}");
+
+        // ========================
+        // Phase 4: 自发光体素 NEE 光源数据
+        // ========================
+        var emissiveVoxels = new List<VoxelElement>();
+        double totalPower = 0.0;
+        foreach (var v in provider.voxelElements)
+        {
+            if (v.materialIndex >= 0 && v.materialIndex < provider.materialElements.Count)
+            {
+                var mat = provider.materialElements[v.materialIndex];
+                if (Mathf.Abs(mat.type - 3f) < 0.5f) // Emissive
+                {
+                    emissiveVoxels.Add(v);
+                    float lum = 0.2126f * mat.color.r + 0.7152f * mat.color.g + 0.0722f * mat.color.b;
+                    totalPower += System.Math.Pow(2.0, mat.flux) * lum;
+                }
+            }
+        }
+
+        int emCount = emissiveVoxels.Count;
+
+        if (emCount > 0 && totalPower > 0.0)
+        {
+            // 构建 alias table（按功率加权）
+            var probs   = new float[emCount];
+            var aliases = new int[emCount];
+            for (int i = 0; i < emCount; i++)
+            {
+                var mat = provider.materialElements[emissiveVoxels[i].materialIndex];
+                float lum = 0.2126f * mat.color.r + 0.7152f * mat.color.g + 0.0722f * mat.color.b;
+                probs[i] = (float)(System.Math.Pow(2.0, mat.flux) * lum / totalPower);
+            }
+            BuildAliasTable(probs, aliases);
+
+            // 上传发光体素数据: float4(x=gridX, y=gridY, z=gridZ, w=matIndex)
+            var lightData = new Vector4[emCount];
+            for (int i = 0; i < emCount; i++)
+            {
+                var v = emissiveVoxels[i];
+                Vector3Int coord = v.worldPos - rootMin;
+                lightData[i] = new Vector4(coord.x, coord.y, coord.z, v.materialIndex);
+            }
+
+            var aliasData = new Vector2[emCount];
+            for (int i = 0; i < emCount; i++)
+                aliasData[i] = new Vector2(probs[i], aliases[i]);
+
+            sEmissiveBuf = new ComputeBuffer(emCount, sizeof(float) * 4);
+            sEmissiveBuf.SetData(lightData);
+            sAliasBuf = new ComputeBuffer(emCount, sizeof(float) * 2);
+            sAliasBuf.SetData(aliasData);
+
+            Shader.SetGlobalBuffer("_EmissiveLights",     sEmissiveBuf);
+            Shader.SetGlobalBuffer("_EmissiveAliasTable", sAliasBuf);
+            Shader.SetGlobalInt  ("_EmissiveLightCount",  emCount);
+            Shader.SetGlobalFloat("_EmissiveTotalPower",  (float)totalPower);
+
+            Debug.Log($"[SVOBuilder] Phase 4: {emCount} 自发光体素, totalPower={(float)totalPower:F2}");
+        }
+        else
+        {
+            Shader.SetGlobalInt  ("_EmissiveLightCount", 0);
+            Shader.SetGlobalFloat("_EmissiveTotalPower", 0f);
+        }
     }
 
     /// <summary>
@@ -157,5 +226,40 @@ public static class SVOBuilder
 
         var childMin = nodeMin + new Vector3Int(cx * half, cy * half, cz * half);
         Insert(pool, (int)n.data + c, coord, mat, level - 1, childMin);
+    }
+
+    /// <summary>
+    /// 构建 alias method 采样表（Vose's alias method）。
+    /// 输入: probs[] 为归一化概率（和为1），aliases[] 输出别名索引。
+    /// </summary>
+    static void BuildAliasTable(float[] probs, int[] aliases)
+    {
+        int n = probs.Length;
+        var scaled = new float[n];
+        for (int i = 0; i < n; i++)
+            scaled[i] = probs[i] * n;
+
+        var small = new Stack<int>();
+        var large = new Stack<int>();
+        for (int i = 0; i < n; i++)
+        {
+            if (scaled[i] < 1.0f) small.Push(i);
+            else large.Push(i);
+        }
+
+        while (small.Count > 0 && large.Count > 0)
+        {
+            int s = small.Pop();
+            int l = large.Pop();
+            probs[s]   = scaled[s];
+            aliases[s] = l;
+            scaled[l]  = (scaled[l] + scaled[s]) - 1.0f;
+            if (scaled[l] < 1.0f) small.Push(l);
+            else large.Push(l);
+        }
+
+        // 处理浮点误差残余
+        while (large.Count > 0) { int l = large.Pop(); probs[l] = 1.0f; }
+        while (small.Count > 0) { int s = small.Pop(); probs[s] = 1.0f; }
     }
 }
