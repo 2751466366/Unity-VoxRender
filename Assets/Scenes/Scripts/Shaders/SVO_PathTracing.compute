@@ -1,4 +1,4 @@
-#pragma kernel CSMain
+﻿#pragma kernel CSMain
 
 // ============================================================
 //  SVO Path Tracing — 体素场景路径追踪计算着色器
@@ -51,7 +51,7 @@ RWTexture2D<float4> _PathTracingResult;
 
 // ---- 常量 ----
 static const float EPSILON = 1e-6f;
-static const int   MAX_STEPS = 4096;
+static const int   MAX_STEPS = 1024;
 static const float PI = 3.14159265359f;
 static const float INV_PI = 0.31830988618f;
 static const float FIREFLY_THRESHOLD = 5.0f;
@@ -170,26 +170,36 @@ int SVOLookup(int3 gridCoord)
     return -1;
 }
 
-// ============================================================
-//  DDA 遍历 SVO（主射线）
-// ============================================================
-int TraverseSVO_DDA(float3 ro, float3 rd,
-                    out float hitT, out float3 hitNGrid, out float hitSide,
-                    out int3 hitVoxel)
+struct SVOStackItem
+{
+    int  nodeIdx;
+    int  level;
+    int3 nodeMin;
+    float tMin;
+    float tMax;
+};
+
+int TraverseSVO_Stack(float3 ro, float3 rd,
+                      out float hitT, out float3 hitPos,
+                      out float3 hitNGrid, out float hitSide,
+                      out int3 hitVoxel)
 {
     hitT     = -1.0;
+    hitPos   = float3(0, 0, 0);
     hitNGrid = float3(0, 1, 0);
     hitSide  = 1.0;
     hitVoxel = int3(0, 0, 0);
 
     float rootSide = exp2((float)_SVODepth);
 
+    // ---------- 1. 预计算 rd 倒数 ----------
     float3 rdInv = float3(
-        abs(rd.x) > EPSILON ? 1.0 / rd.x : 1e10 * sign(rd.x),
-        abs(rd.y) > EPSILON ? 1.0 / rd.y : 1e10 * sign(rd.y),
-        abs(rd.z) > EPSILON ? 1.0 / rd.z : 1e10 * sign(rd.z)
+        abs(rd.x) > EPSILON ? 1.0 / rd.x : (rd.x >= 0.0 ? 1e30 : -1e30),
+        abs(rd.y) > EPSILON ? 1.0 / rd.y : (rd.y >= 0.0 ? 1e30 : -1e30),
+        abs(rd.z) > EPSILON ? 1.0 / rd.z : (rd.z >= 0.0 ? 1e30 : -1e30)
     );
 
+    // ---------- 2. 与根 AABB 求交 ----------
     float3 t0 = -ro * rdInv;
     float3 t1 = (rootSide - ro) * rdInv;
     float3 tMin3 = min(t0, t1);
@@ -202,103 +212,163 @@ int TraverseSVO_DDA(float3 ro, float3 rd,
 
     tEnter = max(tEnter, 0.0);
 
-    float3 currentVoxel = floor(ro + rd * tEnter);
-    currentVoxel = clamp(currentVoxel, float3(0, 0, 0), float3(rootSide - 1, rootSide - 1, rootSide - 1));
+    // ---------- 3. 初始化栈 ----------
+    SVOStackItem stack[64];
+    int sp = 0;
 
-    float3 stepDir = sign(rd);
+    // HLSL 不支持构造函数，逐字段赋值
+    stack[sp].nodeIdx = 0;
+    stack[sp].level   = _SVODepth;
+    stack[sp].nodeMin = int3(0, 0, 0);
+    stack[sp].tMin    = tEnter;
+    stack[sp].tMax    = tExit;
+    sp++;
+
     float3 absRd = abs(rd);
 
-    bool zeroX = absRd.x < EPSILON;
-    bool zeroY = absRd.y < EPSILON;
-    bool zeroZ = absRd.z < EPSILON;
-
-    float3 tDelta = float3(
-        zeroX ? 1e10 : 1.0 / absRd.x,
-        zeroY ? 1e10 : 1.0 / absRd.y,
-        zeroZ ? 1e10 : 1.0 / absRd.z
-    );
-
-    float3 nextBoundary = stepDir > 0 ? currentVoxel + 1.0 : currentVoxel;
-    float3 tMax = (nextBoundary - (ro + rd * tEnter)) / rd;
-    if (zeroX) tMax.x = 1e10;
-    if (zeroY) tMax.y = 1e10;
-    if (zeroZ) tMax.z = 1e10;
-
-    if (tEnter > 0.0)
+    // ---------- 4. 主遍历循环 ----------
+    while (sp > 0)
     {
-        if (tMin3.x >= tMin3.y && tMin3.x >= tMin3.z)
-            hitNGrid = float3(-sign(rd.x), 0, 0);
-        else if (tMin3.y >= tMin3.x && tMin3.y >= tMin3.z)
-            hitNGrid = float3(0, -sign(rd.y), 0);
-        else
-            hitNGrid = float3(0, 0, -sign(rd.z));
-    }
-    else
-    {
-        if (absRd.x >= absRd.y && absRd.x >= absRd.z)
-            hitNGrid = float3(-stepDir.x, 0, 0);
-        else if (absRd.y >= absRd.x && absRd.y >= absRd.z)
-            hitNGrid = float3(0, -stepDir.y, 0);
-        else
-            hitNGrid = float3(0, 0, -stepDir.z);
-    }
+        sp--;
+        SVOStackItem cur = stack[sp];
 
-    [loop]
-    for (int s = 0; s < MAX_STEPS; s++)
-    {
-        if (any(currentVoxel < 0) || any(currentVoxel >= rootSide))
-            break;
+        // 如果当前节点比已找到的命中点更远，跳过
+        if (hitT >= 0.0 && cur.tMin > hitT)
+            continue;
 
-        int3 coord = int3(currentVoxel);
-        int matIndex = SVOLookup(coord);
+        uint4 node = _SVONodes[cur.nodeIdx];
+        uint childMask = node.x;
+        uint data      = node.y;
+        uint flags     = node.z;
 
-        if (matIndex >= 0)
+        // ----- 叶子节点：命中 -----
+        if ((flags & 256u) != 0u)
         {
-            hitT = tEnter;
-            hitSide = 1.0;
-            hitVoxel = coord;
-            return matIndex;
-        }
+            float voxelSize = float(1 << cur.level);
+            float3 voxelMin = float3(cur.nodeMin);
+            float3 voxelMax = voxelMin + voxelSize;
 
-        float stepT;
-        if (tMax.x < tMax.y)
-        {
-            if (tMax.x < tMax.z)
-            {
-                stepT = tMax.x;
-                currentVoxel.x += stepDir.x;
-                tMax.x += tDelta.x;
-                hitNGrid = float3(-stepDir.x, 0, 0);
-            }
+            hitT = cur.tMin;
+            hitVoxel = cur.nodeMin;
+
+            // 精确法线：看进入时哪个轴的 t 等于 cur.tMin
+            float3 vt0 = (voxelMin - ro) * rdInv;
+            float3 vt1 = (voxelMax - ro) * rdInv;
+            float3 vMin3 = min(vt0, vt1);
+
+            float3 n = float3(0, 0, 0);
+            if (abs(vMin3.x - cur.tMin) < 1e-4) n.x = (rd.x > 0.0) ? -1.0 : 1.0;
+            else if (abs(vMin3.y - cur.tMin) < 1e-4) n.y = (rd.y > 0.0) ? -1.0 : 1.0;
+            else n.z = (rd.z > 0.0) ? -1.0 : 1.0;
+
+            hitNGrid = n;
+            hitSide  = (n.x != 0.0) ? 0.0 : ((n.y != 0.0) ? 1.0 : 2.0);
+
+            // 精确坐标投影
+            float3 precisePos = ro + rd * cur.tMin;
+            if (n.x < -0.5) precisePos.x = voxelMin.x; else if (n.x > 0.5) precisePos.x = voxelMax.x;
+            if (n.y < -0.5) precisePos.y = voxelMin.y; else if (n.y > 0.5) precisePos.y = voxelMax.y;
+            if (n.z < -0.5) precisePos.z = voxelMin.z; else if (n.z > 0.5) precisePos.z = voxelMax.z;
+
+            if      (absRd.x >= absRd.y && absRd.x >= absRd.z && abs(rd.x) > EPSILON)
+                hitT = (precisePos.x - ro.x) * rdInv.x;
+            else if (absRd.y >= absRd.x && absRd.y >= absRd.z && abs(rd.y) > EPSILON)
+                hitT = (precisePos.y - ro.y) * rdInv.y;
             else
-            {
-                stepT = tMax.z;
-                currentVoxel.z += stepDir.z;
-                tMax.z += tDelta.z;
-                hitNGrid = float3(0, 0, -stepDir.z);
-            }
+                hitT = (precisePos.z - ro.z) * rdInv.z;
+
+            hitPos = ro + rd * hitT;
+
+            if (n.x < -0.5) hitPos.x = voxelMin.x; else if (n.x > 0.5) hitPos.x = voxelMax.x;
+            if (n.y < -0.5) hitPos.y = voxelMin.y; else if (n.y > 0.5) hitPos.y = voxelMax.y;
+            if (n.z < -0.5) hitPos.z = voxelMin.z; else if (n.z > 0.5) hitPos.z = voxelMax.z;
+
+            return (int)data;
         }
-        else
+
+        // ----- 内部节点：下钻到子节点 -----
+        int half = 1 << (cur.level - 1);
+        float fHalf = float(half);
+        float3 fNodeMin = float3(cur.nodeMin);
+
+        // 收集被射线穿过的非空子节点（最多 4 个）
+        // 注意：数组名不能与局部变量重名
+        float childTMin[4];
+        float childTMax[4];
+        int   childNodeIdx[4];
+        int   childLevel[4];
+        int3  childMin[4];
+        int   childCount = 0;
+
+        [unroll]
+        for (int i = 0; i < 8; i++)
         {
-            if (tMax.y < tMax.z)
+            if ((childMask & (1u << i)) == 0u)
+                continue;
+
+            int cx = i & 1;
+            int cy = (i >> 1) & 1;
+            int cz = (i >> 2) & 1;
+
+            float3 childMinF = fNodeMin + float3(cx * fHalf, cy * fHalf, cz * fHalf);
+            float3 childMaxF = childMinF + fHalf;
+
+            float3 cT0 = (childMinF - ro) * rdInv;
+            float3 cT1 = (childMaxF - ro) * rdInv;
+            float3 cTMin3 = min(cT0, cT1);
+            float3 cTMax3 = max(cT0, cT1);
+            float cTMin = max(max(cTMin3.x, cTMin3.y), cTMin3.z);
+            float cTMax = min(min(cTMax3.x, cTMax3.y), cTMax3.z);
+
+            cTMin = max(cTMin, cur.tMin);
+            cTMax = min(cTMax, cur.tMax);
+
+            if (cTMin <= cTMax && cTMax >= 0.0)
             {
-                stepT = tMax.y;
-                currentVoxel.y += stepDir.y;
-                tMax.y += tDelta.y;
-                hitNGrid = float3(0, -stepDir.y, 0);
-            }
-            else
-            {
-                stepT = tMax.z;
-                currentVoxel.z += stepDir.z;
-                tMax.z += tDelta.z;
-                hitNGrid = float3(0, 0, -stepDir.z);
+                if (hitT < 0.0 || cTMin <= hitT)
+                {
+                    childTMin[childCount]   = cTMin;
+                    childTMax[childCount]   = cTMax;
+                    childNodeIdx[childCount] = (int)data + i;
+                    childLevel[childCount]   = cur.level - 1;
+                    childMin[childCount]     = cur.nodeMin + int3(cx * half, cy * half, cz * half);
+                    childCount++;
+                }
             }
         }
 
-        tEnter = stepT;
-        if (tEnter > tExit)
-            break;
+        // 按 tMin 降序压栈（最小的最后压，栈顶先处理）
+        // 最多 4 个元素，手动冒泡排序
+        if (childCount > 1)
+        {
+            for (int a = 0; a < childCount - 1; a++)
+            {
+                for (int b = a + 1; b < childCount; b++)
+                {
+                    if (childTMin[a] < childTMin[b])
+                    {
+                        float tmpF = childTMin[a]; childTMin[a] = childTMin[b]; childTMin[b] = tmpF;
+                        tmpF = childTMax[a]; childTMax[a] = childTMax[b]; childTMax[b] = tmpF;
+                        int tmpI = childNodeIdx[a]; childNodeIdx[a] = childNodeIdx[b]; childNodeIdx[b] = tmpI;
+                        tmpI = childLevel[a]; childLevel[a] = childLevel[b]; childLevel[b] = tmpI;
+                        int3 tmpM = childMin[a]; childMin[a] = childMin[b]; childMin[b] = tmpM;
+                    }
+                }
+            }
+        }
+
+        for (int k = 0; k < childCount; k++)
+        {
+            if (sp < 64)
+            {
+                stack[sp].nodeIdx = childNodeIdx[k];
+                stack[sp].level   = childLevel[k];
+                stack[sp].nodeMin = childMin[k];
+                stack[sp].tMin    = childTMin[k];
+                stack[sp].tMax    = childTMax[k];
+                sp++;
+            }
+        }
     }
 
     return -1;
@@ -376,20 +446,21 @@ struct DirectLight
 };
 
 // ============================================================
-//  NEE — 阴影射线可见性测试（轻量 DDA）
-//  从体素中心出发，skipVoxel 机制性防自遮挡
-//  maxT: 最大检测距离（HDR 环境光 = INFINITE，自发光体素 = 到光源距离）
+//  NEE — 阴影射线可见性测试（栈式 SVO 加速版）
+//  充分利用稀疏性：空分支直接不压栈
 // ============================================================
-bool ShadowRayVisible(float3 roGrid, float3 lightDirGrid, int3 skipVoxel, float maxT)
+bool ShadowRayVisible_SVO(float3 roGrid, float3 lightDirGrid, int3 skipVoxel, float maxT)
 {
     float rootSide = exp2((float)_SVODepth);
 
+    // ---------- 1. 预计算 rd 倒数 ----------
     float3 rdInv = float3(
-        abs(lightDirGrid.x) > EPSILON ? 1.0 / lightDirGrid.x : 1e10 * sign(lightDirGrid.x),
-        abs(lightDirGrid.y) > EPSILON ? 1.0 / lightDirGrid.y : 1e10 * sign(lightDirGrid.y),
-        abs(lightDirGrid.z) > EPSILON ? 1.0 / lightDirGrid.z : 1e10 * sign(lightDirGrid.z)
+        abs(lightDirGrid.x) > EPSILON ? 1.0 / lightDirGrid.x : (lightDirGrid.x >= 0.0 ? 1e30 : -1e30),
+        abs(lightDirGrid.y) > EPSILON ? 1.0 / lightDirGrid.y : (lightDirGrid.y >= 0.0 ? 1e30 : -1e30),
+        abs(lightDirGrid.z) > EPSILON ? 1.0 / lightDirGrid.z : (lightDirGrid.z >= 0.0 ? 1e30 : -1e30)
     );
 
+    // ---------- 2. 与根 AABB 求交 ----------
     float3 t0 = -roGrid * rdInv;
     float3 t1 = (rootSide - roGrid) * rdInv;
     float3 tMin3 = min(t0, t1);
@@ -398,66 +469,143 @@ bool ShadowRayVisible(float3 roGrid, float3 lightDirGrid, int3 skipVoxel, float 
     float tExit  = min(min(tMax3.x, tMax3.y), tMax3.z);
 
     if (tEnter > tExit || tExit < 0.0)
-        return false;
+        return false;  // 保持与原 DDA 代码一致的语义
 
     tEnter = max(tEnter, 0.0);
 
-    float3 currentVoxel = floor(roGrid + lightDirGrid * tEnter);
-    currentVoxel = clamp(currentVoxel, float3(0,0,0), float3(rootSide-1, rootSide-1, rootSide-1));
+    // 如果 SVO 最近交点都在光源之外 → 直接可见
+    if (tEnter > maxT)
+        return true;
 
-    float3 stepDir = sign(lightDirGrid);
-    float3 absRd = abs(lightDirGrid);
+    // ---------- 3. 初始化栈 ----------
+    SVOStackItem stack[64];
+    int sp = 0;
 
-    float3 tDelta = float3(
-        absRd.x > EPSILON ? 1.0 / absRd.x : 1e10,
-        absRd.y > EPSILON ? 1.0 / absRd.y : 1e10,
-        absRd.z > EPSILON ? 1.0 / absRd.z : 1e10
-    );
+    stack[sp].nodeIdx = 0;
+    stack[sp].level   = _SVODepth;
+    stack[sp].nodeMin = int3(0, 0, 0);
+    stack[sp].tMin    = tEnter;
+    stack[sp].tMax    = min(tExit, maxT); // 超出 maxT 的部分无需遍历
+    sp++;
 
-    float3 nextBoundary = stepDir > 0 ? currentVoxel + 1.0 : currentVoxel;
-    float3 tMax = (nextBoundary - (roGrid + lightDirGrid * tEnter)) / lightDirGrid;
-    if (absRd.x < EPSILON) tMax.x = 1e10;
-    if (absRd.y < EPSILON) tMax.y = 1e10;
-    if (absRd.z < EPSILON) tMax.z = 1e10;
-
-    // 从体素中心出发，第一步直接步进（跳过起始体素 = skipVoxel）
-    [loop]
-    for (int s = 0; s < MAX_STEPS; s++)
+    // ---------- 4. 主遍历 ----------
+    while (sp > 0)
     {
-        // 步进到下一个体素
-        if (tMax.x < tMax.y)
-        {
-            if (tMax.x < tMax.z)
-            { currentVoxel.x += stepDir.x; tMax.x += tDelta.x; }
-            else
-            { currentVoxel.z += stepDir.z; tMax.z += tDelta.z; }
-        }
-        else
-        {
-            if (tMax.y < tMax.z)
-            { currentVoxel.y += stepDir.y; tMax.y += tDelta.y; }
-            else
-            { currentVoxel.z += stepDir.z; tMax.z += tDelta.z; }
-        }
+        sp--;
+        SVOStackItem cur = stack[sp];
 
-        // 超过最大检测距离 → 光源可见（未被遮挡）
-        float tNext = min(min(tMax.x, tMax.y), tMax.z);
-        if (tNext > maxT)
+        // 核心 Early-Out：栈按 tMin 降序排列，一旦弹出的节点都超出 maxT，
+        // 剩余所有节点必然更远，直接判定光源可见
+        if (cur.tMin > maxT)
             return true;
 
-        if (any(currentVoxel < 0) || any(currentVoxel >= rootSide))
-            return true;  // 离开 SVO → 可见天空
+        uint4 node = _SVONodes[cur.nodeIdx];
+        uint childMask = node.x;
+        uint data      = node.y;
+        uint flags     = node.z;
 
-        int3 coord = int3(currentVoxel);
-        if (coord.x == skipVoxel.x && coord.y == skipVoxel.y && coord.z == skipVoxel.z)
-            continue;  // 跳过命中体素（理论上 DDA 单调步进不会重访）
+        // ----- 叶子节点：命中实体 -----
+        if ((flags & 256u) != 0u)
+        {
+            float voxelSizeF = float(1 << cur.level);
+            float3 voxelMin = float3(cur.nodeMin);
+            float3 voxelMax = voxelMin + voxelSizeF;
 
-        int matIndex = SVOLookup(coord);
-        if (matIndex >= 0)
-            return false;  // 被不透明体素遮挡
+            // 只有当射线起点位于该叶子内部，且该叶子包含 skipVoxel 时才跳过
+            // （防止自遮挡；若从外部射入包含 skipVoxel 的大块，则正常遮挡）
+            bool containsSkip = all(skipVoxel >= cur.nodeMin) && 
+                                all(skipVoxel <  cur.nodeMin + int(1 << cur.level));
+            bool roInsideLeaf = all(roGrid >= voxelMin) && all(roGrid < voxelMax);
+
+            if (containsSkip && roInsideLeaf)
+                continue;
+
+            // 在 maxT 范围内命中了实体体素 → 被遮挡
+            return false;
+        }
+
+        // ----- 内部节点：收集被射线穿过的非空子节点 -----
+        int half = 1 << (cur.level - 1);
+        float fHalf = float(half);
+        float3 fNodeMin = float3(cur.nodeMin);
+
+        float childTMin[4];
+        float childTMax[4];
+        int   childNodeIdx[4];
+        int   childLevel[4];
+        int3  childMin[4];
+        int   childCount = 0;
+
+        [unroll]
+        for (int i = 0; i < 8; i++)
+        {
+            if ((childMask & (1u << i)) == 0u)
+                continue; // SVO 核心剔除：空子节点直接跳过
+
+            int cx = i & 1;
+            int cy = (i >> 1) & 1;
+            int cz = (i >> 2) & 1;
+
+            float3 cMinF = fNodeMin + float3(cx * fHalf, cy * fHalf, cz * fHalf);
+            float3 cMaxF = cMinF + fHalf;
+
+            float3 cT0 = (cMinF - roGrid) * rdInv;
+            float3 cT1 = (cMaxF - roGrid) * rdInv;
+            float3 cTMin3 = min(cT0, cT1);
+            float3 cTMax3 = max(cT0, cT1);
+            float cTMin = max(max(cTMin3.x, cTMin3.y), cTMin3.z);
+            float cTMax = min(min(cTMax3.x, cTMax3.y), cTMax3.z);
+
+            // 与父节点有效区间取交集
+            cTMin = max(cTMin, cur.tMin);
+            cTMax = min(cTMax, cur.tMax);
+
+            // 只保留在射线正方向、且在 maxT 范围内的子节点
+            if (cTMin <= cTMax && cTMax >= 0.0 && cTMin <= maxT)
+            {
+                childTMin[childCount]    = cTMin;
+                childTMax[childCount]    = cTMax;
+                childNodeIdx[childCount] = (int)data + i;
+                childLevel[childCount]   = cur.level - 1;
+                childMin[childCount]     = cur.nodeMin + int3(cx * half, cy * half, cz * half);
+                childCount++;
+            }
+        }
+
+        // 按 tMin 降序压栈（最小 tMin 最后压，确保栈顶先处理最近的）
+        if (childCount > 1)
+        {
+            for (int a = 0; a < childCount - 1; a++)
+            {
+                for (int b = a + 1; b < childCount; b++)
+                {
+                    if (childTMin[a] < childTMin[b])
+                    {
+                        float tmpF = childTMin[a]; childTMin[a] = childTMin[b]; childTMin[b] = tmpF;
+                        tmpF = childTMax[a]; childTMax[a] = childTMax[b]; childTMax[b] = tmpF;
+                        int tmpI = childNodeIdx[a]; childNodeIdx[a] = childNodeIdx[b]; childNodeIdx[b] = tmpI;
+                        tmpI = childLevel[a]; childLevel[a] = childLevel[b]; childLevel[b] = tmpI;
+                        int3 tmpM = childMin[a]; childMin[a] = childMin[b]; childMin[b] = tmpM;
+                    }
+                }
+            }
+        }
+
+        for (int k = 0; k < childCount; k++)
+        {
+            if (sp < 64)
+            {
+                stack[sp].nodeIdx = childNodeIdx[k];
+                stack[sp].level   = childLevel[k];
+                stack[sp].nodeMin = childMin[k];
+                stack[sp].tMin    = childTMin[k];
+                stack[sp].tMax    = childTMax[k];
+                sp++;
+            }
+        }
     }
 
-    return true;  // 遍历完毕未命中 → 可见天空
+    return true; // 遍历完毕未命中 → 光源可见
 }
 
 // ============================================================
@@ -774,7 +922,8 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed, out bool hitSk
         float hitT, hitSide;
         float3 hitNGrid;
         int3 hitVoxel;
-        int matIndex = TraverseSVO_DDA(roGrid, rdGrid, hitT, hitNGrid, hitSide, hitVoxel);
+        float3 hitPos;
+        int matIndex = TraverseSVO_Stack(roGrid, rdGrid, hitT, hitPos, hitNGrid, hitSide, hitVoxel);
 
         // ---- 未命中 → 天空（含 MIS 权重）----
         if (matIndex < 0)
@@ -817,7 +966,7 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed, out bool hitSk
 
             // 1. 统一光源采样（当前仅 HDR 环境光，未来自动混合多种光源）
             DirectLight directLight;
-            SampleLights(float3(hitVoxel) + 0.5, NGrid, woGrid, seed, directLight);
+            SampleLights(hitPos, NGrid, woGrid, seed, directLight);
 
             // 2. 有效性检查
             float ndotl = dot(NGrid, directLight.direction);
@@ -837,11 +986,7 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed, out bool hitSk
                         ? directLight.pdf / (directLight.pdf + bsdfPDF)
                         : 1.0f;
 
-                    // 5. 阴影射线可见性（从体素中心出发，跳过命中体素）
-                    float3 shadowRo = float3(hitVoxel) + 0.5;
-                    //float3 shadowRo = roGrid + rdGrid * hitT;
-                    bool visible = ShadowRayVisible(shadowRo, directLight.direction, hitVoxel, directLight.distance);
-
+                    bool visible = ShadowRayVisible_SVO(hitPos, directLight.direction, hitVoxel, directLight.distance);
                     if (visible)
                     {
                         directContrib = throughput
@@ -868,8 +1013,7 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed, out bool hitSk
             break;
 
         // ---- 设置下一弹射线 ----
-        float3 hitPosGrid = roGrid + rdGrid * hitT;
-        roGrid = hitPosGrid + bsdfData.newDir * 0.01f;
+        roGrid = hitPos + bsdfData.newDir * 0.01f;
         rdGrid = bsdfData.newDir;
         rdWorld = newDirWorld;
 

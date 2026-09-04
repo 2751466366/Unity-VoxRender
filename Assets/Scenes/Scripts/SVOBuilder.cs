@@ -186,6 +186,11 @@ public static class SVOBuilder
         }
         else
         {
+            // 无自发光体素时仍需绑定占位 buffer，否则 D3D11 Dispatch 报错
+            sEmissiveBuf = new ComputeBuffer(1, sizeof(float) * 4);
+            sAliasBuf    = new ComputeBuffer(1, sizeof(float) * 2);
+            Shader.SetGlobalBuffer("_EmissiveLights",     sEmissiveBuf);
+            Shader.SetGlobalBuffer("_EmissiveAliasTable", sAliasBuf);
             Shader.SetGlobalInt  ("_EmissiveLightCount", 0);
             Shader.SetGlobalFloat("_EmissiveTotalPower", 0f);
         }
