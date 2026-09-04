@@ -15,9 +15,6 @@ public class VoxModel : MonoBehaviour
     [Tooltip("体素缩放")]
     public float voxelScale = 1f;
 
-    [Tooltip("chunk 代理材质，留空则使用 VoxDataProvider 的默认材质或自动创建")]
-    public Material chunk3DMaterial;
-
     [Header("Load On Start")]
     [Tooltip("Start 时自动加载")]
     public bool loadOnStart = true;
@@ -75,7 +72,7 @@ public class VoxModel : MonoBehaviour
             transform.position = intPos;
         }
 
-        handle = provider.Load(voxFilePath, transform, voxelScale, chunk3DMaterial);
+        handle = provider.Load(voxFilePath, transform);
     }
 
     [ContextMenu("Clear Voxels")]

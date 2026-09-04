@@ -3,25 +3,17 @@ using UnityEngine;
 using VoxReader.Interfaces;
 
 /// <summary>
-/// 集中管理 VOX 文件的解析、3D 纹理与体素数据的创建与存储。
+/// 集中管理 VOX 文件的解析与体素数据的创建与存储。
 /// 外部脚本通过路径加载，获得一个 int 句柄（索引），再用句柄读取数据。
-/// 为后续 SVO 体素路径追踪等高级渲染提供统一的数据入口。
+/// 为 SVO 体素路径追踪等高级渲染提供统一的数据入口。
 /// </summary>
 [ExecuteInEditMode]
 public class VoxDataProvider : MonoBehaviour
 {
     public static VoxDataProvider Instance { get; private set; }
 
-    [Header("Defaults (可被 Load 参数覆盖)")]
-    [Tooltip("体素缩放，当 Load 未指定 scale 时使用")]
-    public float defaultVoxelScale = 1f;
-
-    [Tooltip("chunk 代理材质，未指定时自动使用 Unlit/VoxRender_DDA")]
-    public Material defaultChunkMaterial;
-
-
     [Header("Runtime Assets (只读)")]
-    [Tooltip("所有已加载的 VOX 资产，按句柄索引存取。外部只读访问请用 GetAsset/GetChunkCubes 等方法")]
+    [Tooltip("所有已加载的 VOX 资产，按句柄索引存取。外部只读访问请用 GetAsset 等方法")]
     [SerializeField, HideInInspector] private List<VoxAsset> assets = new List<VoxAsset>();
 
     /// <summary>只读访问资产列表。外部代码不应修改此列表。</summary>
@@ -52,10 +44,8 @@ public class VoxDataProvider : MonoBehaviour
 
     /// <summary>
     /// 加载一个 VOX 文件，返回句柄（索引）。失败返回 -1。
-    /// scale/material 用默认值时取管理器配置。
     /// </summary>
-    public int Load(string voxFilePath, Transform parent = null,
-                    float scale = -1f, Material material = null)
+    public int Load(string voxFilePath, Transform parent = null)
     {
         if (string.IsNullOrEmpty(voxFilePath))
         {
@@ -79,17 +69,13 @@ public class VoxDataProvider : MonoBehaviour
             return -1;
         }
 
-        float useScale = scale > 0f ? scale : defaultVoxelScale;
-        Material useMat = material != null ? material : defaultChunkMaterial;
-        Transform useParent = parent != null ? parent : transform;
-
         var asset = new VoxAsset
         {
             filePath = voxFilePath,
             voxFile = voxFile
         };
 
-        if (!CreateChunks(voxFile, asset, useParent, useScale, useMat))
+        if (!BuildVoxelData(voxFile, asset, parent))
         {
             asset.Dispose();
             return -1;
@@ -109,7 +95,7 @@ public class VoxDataProvider : MonoBehaviour
         {
             assets[handle] = asset;
         }
-        Debug.Log($"[VoxDataProvider] 已加载 '{voxFilePath}'，句柄={handle}，chunk 数={asset.chunks.Count}，体素={voxelElements.Count}，材质={materialElements.Count}");
+        Debug.Log($"[VoxDataProvider] 已加载 '{voxFilePath}'，句柄={handle}，体素={voxelElements.Count}，材质={materialElements.Count}");
         return handle;
     }
 
@@ -123,16 +109,13 @@ public class VoxDataProvider : MonoBehaviour
     }
 
     public IVoxFile GetVoxFile(int handle) => GetAsset(handle)?.voxFile;
-    public IList<Texture3D> GetTextures(int handle) => GetAsset(handle)?.textures;
-    public IList<Material> GetMaterials(int handle) => GetAsset(handle)?.materials;
-    public IList<ChunkInfo> GetChunks(int handle) => GetAsset(handle)?.chunks;
     public IList<VoxelElement> GetVoxelElements(int handle) => voxelElements;
     public IList<MaterialElement> GetMaterialElements(int handle) => materialElements;
 
     /// <summary>已注册资产槽位总数（含已卸载的空槽）。</summary>
     public int Count => assets.Count;
 
-    /// <summary>卸载指定句柄的资产（销毁立方体/纹理/材质，释放槽位）。
+    /// <summary>卸载指定句柄的资产（释放槽位）。
     /// 不将槽位置 null（Unity 序列化不支持 List null 元素），仅标记 isActive=false。</summary>
     public void Unload(int handle)
     {
@@ -271,6 +254,70 @@ public class VoxDataProvider : MonoBehaviour
         materialElements[slot] = me;
     }
 
+    // ---- 内部：构建 voxelElements + materialElements ----
+    bool BuildVoxelData(IVoxFile voxFile, VoxAsset asset, Transform parent)
+    {
+        // Phase A: 构建 materialElements
+        int matBase = materialElements.Count;
+        BuildMaterialElements(voxFile, asset, matBase);
+
+        // parent 位置偏移（四舍五入到整数，SVO 需要整数对齐）
+        Vector3Int parentOffset = parent != null
+            ? new Vector3Int(
+                Mathf.RoundToInt(parent.position.x),
+                Mathf.RoundToInt(parent.position.y),
+                Mathf.RoundToInt(parent.position.z))
+            : Vector3Int.zero;
+
+        // Phase B: 逐 model 构建 voxelElements
+        for (int i = 0; i < voxFile.Models.Length; i++)
+        {
+            var model = voxFile.Models[i];
+
+            int sx = Mathf.Max(1, (int)model.LocalSize.X);
+            int sy = Mathf.Max(1, (int)model.LocalSize.Y);
+            int sz = Mathf.Max(1, (int)model.LocalSize.Z);
+
+            // chunk 在 VOX 文件内的全局偏移（Vox→Unity: Y↔Z 交换，四舍五入到整数）
+            Vector3Int chunkOffset = new Vector3Int(
+                Mathf.RoundToInt(model.GlobalPosition.X),
+                Mathf.RoundToInt(model.GlobalPosition.Z),
+                Mathf.RoundToInt(model.GlobalPosition.Y));
+
+            // chunk 旋转（Vox→Unity 坐标系转换）
+            Quaternion rot = Matrix3ToQuaternion(model.GlobalRotation);
+
+            // chunk 中心在局部空间的位置（含 YZ 交换）
+            Vector3 chunkCenterLocal = new Vector3(sx * 0.5f, sz * 0.5f, sy * 0.5f);
+
+            foreach (var voxel in model.Voxels)
+            {
+                int ix = (int)voxel.LocalPosition.X;
+                int iy = (int)voxel.LocalPosition.Y;
+                int iz = (int)voxel.LocalPosition.Z;
+                if (ix < 0 || ix >= sx || iy < 0 || iy >= sy || iz < 0 || iz >= sz)
+                    continue;
+
+                // 体素相对于 chunk 中心的局部偏移（含 YZ 交换）
+                Vector3 localOffset = new Vector3(ix, iz, iy) - chunkCenterLocal;
+                // 旋转后得到世界空间偏移，加上 chunk 偏移和 parent 偏移
+                Vector3 worldOffset = rot * localOffset;
+                Vector3Int worldPos = parentOffset + chunkOffset + RoundToInt(worldOffset);
+
+                int rawColorIndex = colorIndexFwdMap[voxel.ColorIndex]; // remapped → raw
+                voxelElements.Add(new VoxelElement
+                {
+                    worldPos = worldPos,
+                    materialIndex = matBase + rawColorIndex
+                });
+            }
+        }
+
+        Debug.Log($"[VoxDataProvider] BuildVoxelData 完成：" +
+                  $"{voxelElements.Count} voxelElements, {materialElements.Count} materialElements");
+        return true;
+    }
+
     /// <summary>
     /// 四舍五入到最近的整数（round half up），避免 Unity RoundToInt 的银行家舍入问题。
     /// </summary>
@@ -282,117 +329,6 @@ public class VoxDataProvider : MonoBehaviour
             Mathf.FloorToInt(v.z + 0.5f));
     }
 
-    // ---- 内部：创建 3D 纹理 + voxelElements + ChunkInfo ----
-    bool CreateChunks(IVoxFile voxFile, VoxAsset asset, Transform parent,
-                      float scale, Material baseMat)
-    {
-        if (baseMat == null)
-        {
-            Shader sh = Shader.Find("Unlit/VoxRender_GBuffer");
-            if (sh == null)
-            {
-                Debug.LogError("[VoxDataProvider] 未找到 Unlit/VoxRender_GBuffer shader，无法创建 chunk");
-                return false;
-            }
-            baseMat = new Material(sh);
-            baseMat.name = "VoxGBuffer_Default";
-        }
-
-        // Phase A: 构建 materialElements（chunk 循环前，一次）
-        int matBase = materialElements.Count;  // 记录当前资产的材质起始索引
-        BuildMaterialElements(voxFile, asset, matBase);
-
-        // Phase B: 逐 model 创建 Texture3D + voxelElements + ChunkInfo
-        for (int i = 0; i < voxFile.Models.Length; i++)
-        {
-            var model = voxFile.Models[i];
-
-            int sx = Mathf.Max(1, (int)model.LocalSize.X);
-            int sy = Mathf.Max(1, (int)model.LocalSize.Y);
-            int sz = Mathf.Max(1, (int)model.LocalSize.Z);
-
-            // ---- 3D 纹理 ----
-            var tex = new Texture3D(sx, sy, sz, TextureFormat.RGBA32, false);
-            tex.wrapMode = TextureWrapMode.Clamp;
-            tex.filterMode = FilterMode.Point;
-            tex.name = $"VoxelTex_{model.Name}_m{model.Id}";
-
-            var pixels = new Color[sx * sy * sz];
-            foreach (var voxel in model.Voxels)
-            {
-                int ix = (int)voxel.LocalPosition.X;
-                int iy = (int)voxel.LocalPosition.Y;
-                int iz = (int)voxel.LocalPosition.Z;
-                if (ix < 0 || ix >= sx || iy < 0 || iy >= sy || iz < 0 || iz >= sz) continue;
-                pixels[ix + iy * sx + iz * sx * sy] = new Color(
-                    Mathf.GammaToLinearSpace(voxel.Color.R / 255f),
-                    Mathf.GammaToLinearSpace(voxel.Color.G / 255f),
-                    Mathf.GammaToLinearSpace(voxel.Color.B / 255f),
-                    voxel.Color.A / 255f);
-            }
-            tex.SetPixels(pixels);
-            tex.Apply(false, false);
-            asset.textures.Add(tex);
-
-            // ---- Vox 变换参数 ----
-            Quaternion rot = Matrix3ToQuaternion(model.GlobalRotation);
-            Vector3 chunkMin = parent.position + VoxToUnityPosition(model.GlobalPosition) * scale; // chunk 最小角
-            Vector3 chunkSize = new Vector3(sx, sz, sy) * scale; // Vox->Unity: Y<->Z
-
-            // ---- ChunkInfo ----
-            var chunkInfo = new ChunkInfo();
-            chunkInfo.dims = new Vector3Int(sx, sy, sz);
-            Vector3 rotHalf = rot * (chunkSize * 0.5f);
-            chunkInfo.worldMin = chunkMin + Vector3.Min(rotHalf, -rotHalf);
-            chunkInfo.worldMax = chunkMin + Vector3.Max(rotHalf, -rotHalf);
-
-            // ---- 体素坐标计算（直接用 rot，不依赖 cube Transform） ----
-            int minCI = int.MaxValue, maxCI = int.MinValue;
-            foreach (var voxel in model.Voxels)
-            {
-                int ix = (int)voxel.LocalPosition.X;
-                int iy = (int)voxel.LocalPosition.Y;
-                int iz = (int)voxel.LocalPosition.Z;
-                if (ix < 0 || ix >= sx || iy < 0 || iy >= sy || iz < 0 || iz >= sz) 
-                    continue;
-            
-                // 体素相对于 chunk 中心的局部偏移（含 YZ 交换）
-                Vector3 localOffset = new Vector3(
-                    (ix - sx * 0.5f) * scale,
-                    (iz - sz * 0.5f) * scale,   // Vox Y → Unity Z
-                    (iy - sy * 0.5f) * scale);  // Vox Z → Unity Y
-                // 旋转后得到世界空间偏移，加上 chunk 最小角
-                Vector3 worldMinCorner = chunkMin + rot * localOffset;
-                Vector3Int sceneMinCorner = RoundToInt(worldMinCorner / scale);
-                int rawColorIndex = colorIndexFwdMap[voxel.ColorIndex]; // remapped → raw
-                voxelElements.Add(new VoxelElement
-                {
-                    worldPos = sceneMinCorner,
-                    materialIndex = matBase + rawColorIndex
-                });
-                if (rawColorIndex < minCI) minCI = rawColorIndex;
-                if (rawColorIndex > maxCI) maxCI = rawColorIndex;
-            }
-
-            // ---- 材质实例 ----
-            var instMat = new Material(baseMat);
-            instMat.name = $"Mat_{model.Name}_m{model.Id}";
-            instMat.SetTexture("_VoxelTexture", tex);
-            instMat.SetVector("_ChunkSize", new Vector4(sx, sy, sz, 0));
-            instMat.SetFloat("_VoxelScale", scale);
-            asset.materials.Add(instMat);
-            asset.chunks.Add(chunkInfo);
-        }
-
-        Debug.Log($"[VoxDataProvider] CreateChunks 完成：{asset.chunks.Count} chunks, " +
-                  $"{voxelElements.Count} voxelElements, {materialElements.Count} materialElements");
-        return true;
-    }
-
-
-
-    static Vector3 VoxToUnityPosition(VoxReader.Vector3 v) => new Vector3(v.X, v.Z, v.Y);
-
     /// <summary>将 VoxReader.Matrix3（Vox 坐标系）转换为 Unity Quaternion。
     /// 自动完成 Vox→Unity 的 Y/Z 轴交换。</summary>
     static Quaternion Matrix3ToQuaternion(VoxReader.Matrix3 m)
@@ -403,8 +339,6 @@ public class VoxDataProvider : MonoBehaviour
 
         // Vox→Unity: X→X, Y→Z, Z→Y
         // R_unity = SwapYZ * R_vox * SwapYZ
-        // 行交换: row0→row0, row1→row2, row2→row1
-        // 列交换: col0→col0, col1→col2, col2→col1
         float u00 = m00,  u01 = m02,  u02 = m01;
         float u10 = m20,  u11 = m22,  u12 = m21;
         float u20 = m10,  u21 = m12,  u22 = m11;
@@ -420,7 +354,7 @@ public class VoxDataProvider : MonoBehaviour
 }
 
 /// <summary>
-/// 一个已加载的 VOX 资产：包含解析数据、SVO 输入（扁平 GPU-ready 数组）、DDA pass 用资源。
+/// 一个已加载的 VOX 资产：包含解析数据、SVO 输入（扁平 GPU-ready 数组）。
 /// 由 VoxDataProvider 创建并管理生命周期。
 /// </summary>
 [System.Serializable]
@@ -429,31 +363,12 @@ public class VoxAsset
     public string filePath;
     [System.NonSerialized] public IVoxFile voxFile;
 
-    // DDA pass 用：按 chunk 索引平行存储
-    public List<ChunkInfo> chunks   = new List<ChunkInfo>();
-    public List<Texture3D> textures = new List<Texture3D>();
-    public List<Material>  materials = new List<Material>();
-
     /// <summary>标记资产是否有效。Dispose 后置为 false，参与序列化以跨重编译保持。</summary>
     public bool isActive = true;
 
-    /// <summary>销毁所有关联的 Unity 资源（材质/纹理）。</summary>
+    /// <summary>标记资产为无效。</summary>
     public void Dispose()
     {
-        foreach (var m in materials)
-            if (m != null) DestroyUnityObj(m);
-        foreach (var t in textures)
-            if (t != null) DestroyUnityObj(t);
-        chunks.Clear();
-        materials.Clear();
-        textures.Clear();
         isActive = false;
-    }
-
-    static void DestroyUnityObj(Object obj)
-    {
-        if (obj == null) return;
-        if (Application.isPlaying) Object.Destroy(obj);
-        else Object.DestroyImmediate(obj);
     }
 }

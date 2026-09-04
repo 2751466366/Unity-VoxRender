@@ -58,13 +58,3 @@ public struct SVONode
     public static SVONode MakeEmptyInternal() =>
         new SVONode { childMask = 0, data = 0, flags = 0 };
 }
-
-/// <summary>
-/// Chunk 信息：仅 DDA pass + 算 bounds 用，SVO 不直接读取。
-/// </summary>
-[System.Serializable]
-public class ChunkInfo
-{
-    public Vector3Int dims;                    // Vox 空间 (sx, sy, sz)
-    public Vector3 worldMin, worldMax;         // 旋转后的世界 AABB
-}

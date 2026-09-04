@@ -29,12 +29,6 @@ public class VoxDataProviderEditor : Editor
                 ? $"Element {i}: {a.filePath}"
                 : $"Element {i}: [已卸载]";
             EditorGUILayout.LabelField(label);
-
-            EditorGUI.indentLevel++;
-            EditorGUILayout.IntField("Chunks", a.chunks.Count);
-            EditorGUILayout.IntField("Textures", a.textures.Count);
-            EditorGUILayout.IntField("Materials", a.materials.Count);
-            EditorGUI.indentLevel--;
         }
 
         EditorGUI.EndDisabledGroup();

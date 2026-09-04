@@ -276,22 +276,9 @@ public class CameraRender : MonoBehaviour
         );
         gBufferCmd.ClearRenderTarget(true, true, Color.clear);
 
-        // 遍历 VoxDataProvider 中所有活跃的 chunk，用各自的材质绘制
+        // 遍历 VoxDataProvider 中所有活跃的资产
         var provider = VoxDataProvider.Instance;
         if (provider == null) return;
-
-        foreach (var asset in provider.Assets)
-        {
-            if (asset == null || !asset.isActive) continue;
-            for (int i = 0; i < asset.chunks.Count; i++)
-            {
-                var chunk = asset.chunks[i];
-                // TODO: 延迟渲染改为 SVO 输出 G-buffer 后移除 cube 依赖
-                // var cube = chunk != null ? chunk.cube : null;
-                var mat  = i < asset.materials.Count ? asset.materials[i] : null;
-                if (mat == null) continue;
-            }
-        }
     }
 
     /// <summary>查找场景中第一个启用的 Directional Light，设置光照参数。</summary>
@@ -475,22 +462,10 @@ public class CameraRender : MonoBehaviour
 
     private bool _svoVisLogged = false;
 
-    /// <summary>启用/禁用所有 chunk cube 的 MeshRenderer（防止标准管线渲染覆盖计算着色器输出）。</summary>
+    /// <summary>启用/禁用所有 chunk 的渲染（已废弃，SVO 管线不再依赖 cube renderer）。</summary>
     void SetChunkRenderersEnabled(bool enabled)
     {
-        var provider = VoxDataProvider.Instance;
-        if (provider == null) return;
-        foreach (var asset in provider.Assets)
-        {
-            if (asset == null || !asset.isActive) continue;
-            foreach (var chunk in asset.chunks)
-            {
-                // TODO: 延迟渲染改为 SVO 输出 G-buffer 后移除
-                // if (chunk?.cube == null) continue;
-                // var renderer = chunk.cube.GetComponent<MeshRenderer>();
-                // if (renderer != null) renderer.enabled = enabled;
-            }
-        }
+        // SVO 管线不再依赖 chunk cube renderer，保留空方法以兼容调用点
     }
 
     /// <summary>在 OnPreRender 中调度 SVO 路径追踪计算着色器，渲染到 pathTracingRT。</summary>

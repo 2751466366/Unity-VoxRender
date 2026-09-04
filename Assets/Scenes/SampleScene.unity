@@ -168,7 +168,6 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   voxFilePath: Assets/Scenes/Vox/room.vox
   voxelScale: 1
-  chunk3DMaterial: {fileID: 0}
   loadOnStart: 1
   handle: -1
 --- !u!1 &705507993
@@ -353,7 +352,7 @@ Transform:
   m_GameObject: {fileID: 963194225}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: -20, y: 4, z: -30}
+  m_LocalPosition: {x: 0, y: 20, z: -40}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -409,7 +408,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!114 &1171443739
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -424,7 +423,6 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   voxFilePath: Assets/Scenes/Vox/castle.vox
   voxelScale: 1
-  chunk3DMaterial: {fileID: 0}
   loadOnStart: 1
   handle: -1
 --- !u!4 &1171443740
@@ -486,18 +484,10 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 4a0f23ba1c2214a4fa7cf3c729f9d30e, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  defaultVoxelScale: 1
-  defaultChunkMaterial: {fileID: 0}
   assets:
   - filePath: Assets/Scenes/Vox/room.vox
-    chunks: []
-    textures: []
-    materials: []
     isActive: 0
   - filePath: Assets/Scenes/Vox/castle.vox
-    chunks: []
-    textures: []
-    materials: []
     isActive: 0
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
