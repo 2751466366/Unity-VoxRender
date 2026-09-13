@@ -1,0 +1,387 @@
+#pragma kernel CSMain
+
+// ============================================================
+//  SVO G-Buffer 计算着色器（几何阶段）
+//
+//  参考 SVO_PathTracing.compute 的栈式遍历实现：
+//    沿相机射线遍历 SVO，命中体素后将 Albedo / Normal / WorldPos
+//    写入 3 张 G-Buffer RT，供后续 Lighting 阶段使用。
+//
+//  复用自 SVO_PathTracing.compute：
+//    SVOLookup, SVOStackItem, TraverseSVO_Stack,
+//    ReadMaterial, VoxelMaterial, GridDirToWorld
+// ============================================================
+
+// ---- SVO 数据（由 SVOBuilder 上传） ----
+StructuredBuffer<uint4>   _SVONodes;       // childMask, data, flags, _pad
+StructuredBuffer<float4>  _SVOMaterials;   // 每 3 个 float4 一项 (48B)
+
+float3 _SVORootMin;   // 根节点最小角（世界空间）
+float  _SVOScale;     // 体素缩放
+int    _SVODepth;     // 八叉树深度
+
+// ---- 相机参数 ----
+float4x4 _InverseVP;  // 逆 ViewProjection（裁剪空间 → 世界空间）
+float3   _CameraPos;  // 相机世界坐标
+
+// ---- G-Buffer 输出 ----
+RWTexture2D<float4> _GBufferAlbedo;    // RT0: rgb=color, a=hit(1/0)
+RWTexture2D<float4> _GBufferNormal;    // RT1: rgb=packed normal[0,1], a=1
+RWTexture2D<float4> _GBufferWorldPos;  // RT2: rgb=worldPos, a=1
+
+// ---- 常量 ----
+static const float EPSILON = 1e-6f;
+static const float INFINITE = 1e30f;
+
+// ============================================================
+//  SVO 查找：给定网格空间整数坐标，返回叶子节点的 materialIndex
+// ============================================================
+int SVOLookup(int3 gridCoord)
+{
+    int nodeIdx = 0;
+    int level = _SVODepth;
+    int3 nodeMin = int3(0, 0, 0);
+
+    [loop]
+    while (level > 0)
+    {
+        uint4 node = _SVONodes[nodeIdx];
+        uint childMask = node.x;
+        uint data = node.y;
+        uint flags = node.z;
+
+        if ((flags & 256u) != 0u)
+            return (int)data;
+
+        int half = 1 << (level - 1);
+        int cx = (gridCoord.x >= nodeMin.x + half) ? 1 : 0;
+        int cy = (gridCoord.y >= nodeMin.y + half) ? 1 : 0;
+        int cz = (gridCoord.z >= nodeMin.z + half) ? 1 : 0;
+        int c = cx | (cy << 1) | (cz << 2);
+
+        if ((childMask & (1u << c)) == 0u)
+            return -1;
+
+        nodeIdx = (int)data + c;
+        nodeMin += int3(cx * half, cy * half, cz * half);
+        level--;
+    }
+
+    uint4 leafNode = _SVONodes[nodeIdx];
+    if ((leafNode.z & 256u) != 0u)
+        return (int)leafNode.y;
+
+    return -1;
+}
+
+// ============================================================
+//  栈元素结构体（用于 SVO 遍历）
+// ============================================================
+struct SVOStackItem
+{
+    int   nodeIdx;
+    int   level;
+    int3  nodeMin;
+    float tMin;
+    float tMax;
+};
+
+// ============================================================
+//  栈式 SVO 遍历（参考 SVO_PathTracing.compute TraverseSVO_Stack）
+//
+//  ro/rd 为网格空间
+//  out hitT:     命中距离（网格空间射线参数）
+//  out hitPos:   命中点（网格空间）
+//  out hitNGrid: 命中面法线（网格空间，轴对齐）
+//  out hitSide:  命中面主轴 (0=X, 1=Y, 2=Z)
+//  out hitVoxel: 命中体素的整数坐标
+//  返回 materialIndex，未命中返回 -1
+// ============================================================
+int TraverseSVO_Stack(float3 ro, float3 rd,
+                      out float hitT, out float3 hitPos,
+                      out float3 hitNGrid, out float hitSide,
+                      out int3 hitVoxel)
+{
+    hitT     = -1.0;
+    hitPos   = float3(0, 0, 0);
+    hitNGrid = float3(0, 1, 0);
+    hitSide  = 1.0;
+    hitVoxel = int3(0, 0, 0);
+
+    float rootSide = exp2((float)_SVODepth);
+
+    // 预计算 rd 倒数
+    float3 rdInv = float3(
+        abs(rd.x) > EPSILON ? 1.0 / rd.x : (rd.x >= 0.0 ? 1e30 : -1e30),
+        abs(rd.y) > EPSILON ? 1.0 / rd.y : (rd.y >= 0.0 ? 1e30 : -1e30),
+        abs(rd.z) > EPSILON ? 1.0 / rd.z : (rd.z >= 0.0 ? 1e30 : -1e30)
+    );
+
+    // 与根 AABB 求交
+    float3 t0 = -ro * rdInv;
+    float3 t1 = (rootSide - ro) * rdInv;
+    float3 tMin3 = min(t0, t1);
+    float3 tMax3 = max(t0, t1);
+    float tEnter = max(max(tMin3.x, tMin3.y), tMin3.z);
+    float tExit  = min(min(tMax3.x, tMax3.y), tMax3.z);
+
+    if (tEnter > tExit || tExit < 0.0)
+        return -1;
+
+    tEnter = max(tEnter, 0.0);
+
+    // 初始化栈
+    SVOStackItem stack[64];
+    int sp = 0;
+
+    stack[sp].nodeIdx = 0;
+    stack[sp].level   = _SVODepth;
+    stack[sp].nodeMin = int3(0, 0, 0);
+    stack[sp].tMin    = tEnter;
+    stack[sp].tMax    = tExit;
+    sp++;
+
+    float3 absRd = abs(rd);
+
+    // 主遍历循环
+    while (sp > 0)
+    {
+        sp--;
+        SVOStackItem cur = stack[sp];
+
+        if (hitT >= 0.0 && cur.tMin > hitT)
+            continue;
+
+        uint4 node = _SVONodes[cur.nodeIdx];
+        uint childMask = node.x;
+        uint data      = node.y;
+        uint flags     = node.z;
+
+        // 叶子节点
+        if ((flags & 256u) != 0u)
+        {
+            float voxelSize = float(1 << cur.level);
+            float3 voxelMin = float3(cur.nodeMin);
+            float3 voxelMax = voxelMin + voxelSize;
+
+            hitT = cur.tMin;
+            hitVoxel = cur.nodeMin;
+
+            // 精确法线：看进入时哪个轴的 t 等于 cur.tMin
+            float3 vt0 = (voxelMin - ro) * rdInv;
+            float3 vt1 = (voxelMax - ro) * rdInv;
+            float3 vMin3 = min(vt0, vt1);
+
+            float3 n = float3(0, 0, 0);
+            if (abs(vMin3.x - cur.tMin) < 1e-4) n.x = (rd.x > 0.0) ? -1.0 : 1.0;
+            else if (abs(vMin3.y - cur.tMin) < 1e-4) n.y = (rd.y > 0.0) ? -1.0 : 1.0;
+            else n.z = (rd.z > 0.0) ? -1.0 : 1.0;
+
+            hitNGrid = n;
+            hitSide  = (n.x != 0.0) ? 0.0 : ((n.y != 0.0) ? 1.0 : 2.0);
+
+            // 精确坐标投影
+            float3 precisePos = ro + rd * cur.tMin;
+            if (n.x < -0.5) precisePos.x = voxelMin.x; else if (n.x > 0.5) precisePos.x = voxelMax.x;
+            if (n.y < -0.5) precisePos.y = voxelMin.y; else if (n.y > 0.5) precisePos.y = voxelMax.y;
+            if (n.z < -0.5) precisePos.z = voxelMin.z; else if (n.z > 0.5) precisePos.z = voxelMax.z;
+
+            if      (absRd.x >= absRd.y && absRd.x >= absRd.z && abs(rd.x) > EPSILON)
+                hitT = (precisePos.x - ro.x) * rdInv.x;
+            else if (absRd.y >= absRd.x && absRd.y >= absRd.z && abs(rd.y) > EPSILON)
+                hitT = (precisePos.y - ro.y) * rdInv.y;
+            else
+                hitT = (precisePos.z - ro.z) * rdInv.z;
+
+            hitPos = ro + rd * hitT;
+
+            if (n.x < -0.5) hitPos.x = voxelMin.x; else if (n.x > 0.5) hitPos.x = voxelMax.x;
+            if (n.y < -0.5) hitPos.y = voxelMin.y; else if (n.y > 0.5) hitPos.y = voxelMax.y;
+            if (n.z < -0.5) hitPos.z = voxelMin.z; else if (n.z > 0.5) hitPos.z = voxelMax.z;
+
+            return (int)data;
+        }
+
+        // 内部节点：收集被射线穿过的非空子节点
+        int half = 1 << (cur.level - 1);
+        float fHalf = float(half);
+        float3 fNodeMin = float3(cur.nodeMin);
+
+        float childTMin[4];
+        float childTMax[4];
+        int   childNodeIdx[4];
+        int   childLevel[4];
+        int3  childMin[4];
+        int   childCount = 0;
+
+        [unroll]
+        for (int i = 0; i < 8; i++)
+        {
+            if ((childMask & (1u << i)) == 0u)
+                continue;
+
+            int cx = i & 1;
+            int cy = (i >> 1) & 1;
+            int cz = (i >> 2) & 1;
+
+            float3 childMinF = fNodeMin + float3(cx * fHalf, cy * fHalf, cz * fHalf);
+            float3 childMaxF = childMinF + fHalf;
+
+            float3 cT0 = (childMinF - ro) * rdInv;
+            float3 cT1 = (childMaxF - ro) * rdInv;
+            float3 cTMin3 = min(cT0, cT1);
+            float3 cTMax3 = max(cT0, cT1);
+            float cTMin = max(max(cTMin3.x, cTMin3.y), cTMin3.z);
+            float cTMax = min(min(cTMax3.x, cTMax3.y), cTMax3.z);
+
+            cTMin = max(cTMin, cur.tMin);
+            cTMax = min(cTMax, cur.tMax);
+
+            if (cTMin <= cTMax && cTMax >= 0.0 && cTMin <= (hitT >= 0.0 ? hitT : INFINITE))
+            {
+                childTMin[childCount]    = cTMin;
+                childTMax[childCount]    = cTMax;
+                childNodeIdx[childCount] = (int)data + i;
+                childLevel[childCount]   = cur.level - 1;
+                childMin[childCount]     = cur.nodeMin + int3(cx * half, cy * half, cz * half);
+                childCount++;
+            }
+        }
+
+        // 按 tMin 降序压栈（最小 tMin 最后压，栈顶先处理）
+        if (childCount > 1)
+        {
+            for (int a = 0; a < childCount - 1; a++)
+            {
+                for (int b = a + 1; b < childCount; b++)
+                {
+                    if (childTMin[a] < childTMin[b])
+                    {
+                        float tmpF = childTMin[a]; childTMin[a] = childTMin[b]; childTMin[b] = tmpF;
+                        tmpF = childTMax[a]; childTMax[a] = childTMax[b]; childTMax[b] = tmpF;
+                        int tmpI = childNodeIdx[a]; childNodeIdx[a] = childNodeIdx[b]; childNodeIdx[b] = tmpI;
+                        tmpI = childLevel[a]; childLevel[a] = childLevel[b]; childLevel[b] = tmpI;
+                        int3 tmpM = childMin[a]; childMin[a] = childMin[b]; childMin[b] = tmpM;
+                    }
+                }
+            }
+        }
+
+        for (int k = 0; k < childCount; k++)
+        {
+            if (sp < 64)
+            {
+                stack[sp].nodeIdx = childNodeIdx[k];
+                stack[sp].level   = childLevel[k];
+                stack[sp].nodeMin = childMin[k];
+                stack[sp].tMin    = childTMin[k];
+                stack[sp].tMax    = childTMax[k];
+                sp++;
+            }
+        }
+    }
+
+    return -1;
+}
+
+// ============================================================
+//  网格空间方向 → 世界空间方向
+//  SVO 网格空间 = 世界空间（仅平移+缩放），坐标轴方向一致
+// ============================================================
+float3 GridDirToWorld(float3 gridD)
+{
+    return normalize(gridD);
+}
+
+// ============================================================
+//  读取完整材质参数（48B = 3×float4）
+// ============================================================
+struct VoxelMaterial
+{
+    float  type;
+    float  weight;
+    float  rough;
+    float  spec;
+    float  ior;
+    float  att;
+    float  flux;
+    float3 color;
+    float  alpha;
+};
+
+VoxelMaterial ReadMaterial(int matIndex)
+{
+    VoxelMaterial mat;
+    uint base = (uint)matIndex * 3u;
+
+    float4 slot0 = _SVOMaterials[base];
+    float4 slot1 = _SVOMaterials[base + 1u];
+    float4 slot2 = _SVOMaterials[base + 2u];
+
+    mat.type   = slot0.x;
+    mat.weight = slot0.y;
+    mat.rough  = max(slot0.z, 0.01f);
+    mat.spec   = slot0.w;
+    mat.ior    = slot1.x;
+    mat.att    = slot1.y;
+    mat.flux   = slot1.z;
+    mat.color  = slot2.rgb;
+    mat.alpha  = slot2.w;
+
+    return mat;
+}
+
+// ============================================================
+//  CSMain — 每像素 SVO 遍历，写入 G-Buffer
+// ============================================================
+[numthreads(8, 8, 1)]
+void CSMain(uint3 dtid : SV_DispatchThreadID)
+{
+    uint2 pixel = dtid.xy;
+    uint2 dims;
+    _GBufferAlbedo.GetDimensions(dims.x, dims.y);
+    if (pixel.x >= dims.x || pixel.y >= dims.y) return;
+
+    // ---- 构建相机射线（世界空间） ----
+    float2 uv = (float2(pixel) + 0.5) / float2(dims);
+    float4 clipPos = float4(uv * 2.0 - 1.0, 1.0, 1.0);
+    float4 farWorldPos = mul(_InverseVP, clipPos);
+    farWorldPos /= farWorldPos.w;
+
+    float3 rd = normalize(farWorldPos.xyz - _CameraPos);
+    float3 ro = _CameraPos;
+
+    // ---- 世界空间 → 网格空间 ----
+    float3 roGrid = ro - _SVORootMin;  // 不除以 scale，与 CPU 端一致
+    float3 rdGrid = rd;
+
+    // ---- SVO 栈式遍历 ----
+    float hitT, hitSide;
+    float3 hitNGrid, hitPos;
+    int3 hitVoxel;
+    int matIndex = TraverseSVO_Stack(roGrid, rdGrid, hitT, hitPos, hitNGrid, hitSide, hitVoxel);
+
+    if (matIndex < 0)
+    {
+        // 未命中 → 清除值（alpha=0 表示无体素）
+        _GBufferAlbedo[pixel]   = float4(0, 0, 0, 0);
+        _GBufferNormal[pixel]   = float4(0, 0, 0, 0);
+        _GBufferWorldPos[pixel] = float4(0, 0, 0, 0);
+        return;
+    }
+
+    // ---- 读取材质 ----
+    VoxelMaterial mat = ReadMaterial(matIndex);
+    float3 voxelColor = pow(max(mat.color, 0.0), 1.0 / 2.2); // gamma 校正
+
+    // ---- 法线：网格空间 → 世界空间 ----
+    float3 worldNormal = GridDirToWorld(hitNGrid);
+
+    // ---- 命中点：网格空间 → 世界空间（网格坐标已是世界空间） ----
+    float3 hitWorld = hitPos + _SVORootMin;
+
+    // ---- 写入 G-Buffer ----
+    _GBufferAlbedo[pixel]   = float4(voxelColor, 1.0);             // rgb=color, a=1(hit)
+    _GBufferNormal[pixel]   = float4(worldNormal * 0.5 + 0.5, 1.0); // packed to [0,1]
+    _GBufferWorldPos[pixel] = float4(hitWorld, 1.0);
+}

@@ -10,7 +10,7 @@
 //    1. 多弹射路径追踪（可配置 maxDepth）
 //    2. BRDF 材质采样（Diffuse / Metal / Glass / Emissive / Cloud / Blend）
 //    3. NEE 直接光照估计 + MIS（Multiple Importance Sampling）
-//    4. 统一光源采样框架（当前 HDR 环境光，预留点光/方向光/自发光体素扩展）
+//    4. 统一光源采样框架（HDR 环境光 + 方向光 + 自发光体素）
 //    5. 余弦加权半球环境光采样 + Cubemap 查询
 //    6. 阴影射线可见性测试（体素中心出发 + skipVoxel 防自遮挡）
 //    7. 子像素抗锯齿抖动 + 时域渐进累积
@@ -41,6 +41,11 @@ TextureCube _SkyboxTex;
 SamplerState sampler_SkyboxTex;
 float _HasSkyCube;    // 1.0 = Cubemap 已绑定
 float3 _SkyColor;     // 回退天空颜色
+
+// ---- 方向光（太阳）----
+float3 _SunDir;       // 指向光源方向（世界空间）
+float3 _SunColor;     // 光照颜色 × 强度
+float  _HasSun;       // 1.0 = 方向光启用
 
 // ---- 路径追踪参数 ----
 int  _MaxDepth;       // 最大弹射深度
@@ -511,13 +516,14 @@ bool ShadowRayVisible_SVO(float3 roGrid, float3 lightDirGrid, int3 skipVoxel, fl
             float3 voxelMin = float3(cur.nodeMin);
             float3 voxelMax = voxelMin + voxelSizeF;
 
-            // 只有当射线起点位于该叶子内部，且该叶子包含 skipVoxel 时才跳过
-            // （防止自遮挡；若从外部射入包含 skipVoxel 的大块，则正常遮挡）
+            // 跳过 hit voxel（containsSkip）或包含射线起点的叶子（roInsideLeaf）
+            // containsSkip：阴影射线命中了主射线的 hit voxel → 自遮挡，跳过
+            // roInsideLeaf：射线起点在该叶子内部（边界精度问题导致进入相邻体素）→ 跳过
             bool containsSkip = all(skipVoxel >= cur.nodeMin) && 
                                 all(skipVoxel <  cur.nodeMin + int(1 << cur.level));
             bool roInsideLeaf = all(roGrid >= voxelMin) && all(roGrid < voxelMax);
 
-            if (containsSkip && roInsideLeaf)
+            if (containsSkip || roInsideLeaf)
                 continue;
 
             // 在 maxT 范围内命中了实体体素 → 被遮挡
@@ -752,8 +758,33 @@ float3 SampleEnvironmentLight(float3 NGrid, inout uint seed,
 }
 
 // ============================================================
+//  NEE — 方向光（太阳）采样
+//  Delta 光源：方向固定，PDF 为常数近似
+// ============================================================
+bool SampleSunLight(float3 NGrid, inout uint seed, out DirectLight directLight)
+{
+    directLight.pdf = 0.0;
+    directLight.distance = INFINITE;
+    directLight.radianceOverPdf = float3(0, 0, 0);
+    directLight.direction = float3(0, 1, 0);
+
+    if (_HasSun < 0.5f) return false;
+
+    // 太阳方向从世界空间转到网格空间（SVO 网格=世界，轴方向一致）
+    float3 sunDirGrid = normalize(_SunDir);
+    float ndotl = dot(NGrid, sunDirGrid);
+    if (ndotl <= 0.0f) return false;
+
+    directLight.direction = sunDirGrid;
+    directLight.radianceOverPdf = _SunColor;
+    directLight.pdf = 1.0f;  // delta 光源，MIS weight = 1.0
+
+    return true;
+}
+
+// ============================================================
 //  NEE — 统一光源采样入口
-//  HDR 环境光 + 自发光体素，one-sample MIS 混合
+//  HDR 环境光 + 方向光 + 自发光体素，one-sample MIS 混合
 // ============================================================
 void SampleLights(float3 hitPosGrid, float3 NGrid, float3 woGrid,
                   inout uint seed, out DirectLight directLight)
@@ -763,15 +794,16 @@ void SampleLights(float3 hitPosGrid, float3 NGrid, float3 woGrid,
     directLight.radianceOverPdf = float3(0, 0, 0);
     directLight.direction = float3(0, 1, 0);
 
-    float envWeight = (_HasSkyCube > 0.5f) ? 0.5f : 0.0f;
-    float emWeight  = (_EmissiveLightCount > 0) ? 0.5f : 0.0f;
-    float totalW = envWeight + emWeight;
+    float envWeight = (_HasSkyCube > 0.5f) ? 0.33f : 0.0f;
+    float sunWeight = (_HasSun > 0.5f) ? 0.34f : 0.0f;
+    float emWeight  = (_EmissiveLightCount > 0) ? 0.33f : 0.0f;
+    float totalW = envWeight + sunWeight + emWeight;
     if (totalW < 1e-6f) return;
 
     // 按权重随机选择一种光源采样（one-sample MIS）
-    bool sampleEnv = (rand(seed) * totalW < envWeight);
+    float r = rand(seed) * totalW;
 
-    if (sampleEnv && _HasSkyCube > 0.5f)
+    if (r < envWeight && _HasSkyCube > 0.5f)
     {
         // ---- HDR 环境光采样 ----
         float3 lightDirGrid;
@@ -779,9 +811,19 @@ void SampleLights(float3 hitPosGrid, float3 NGrid, float3 woGrid,
         float3 radianceOverPdf = SampleEnvironmentLight(NGrid, seed, lightDirGrid, envPDF);
 
         directLight.direction = lightDirGrid;
-        directLight.pdf = envPDF * (envWeight / totalW);
+        directLight.pdf = envPDF;  // 原始 PDF，选择概率在期望中自然消掉
         directLight.radianceOverPdf = radianceOverPdf;
         // distance 保持 INFINITE
+    }
+    else if (r < envWeight + sunWeight && _HasSun > 0.5f)
+    {
+        // ---- 方向光采样 ----
+        DirectLight sunLight;
+        if (SampleSunLight(NGrid, seed, sunLight))
+        {
+            directLight = sunLight;
+            directLight.pdf = sunLight.pdf;  // 原始 PDF
+        }
     }
     else if (_EmissiveLightCount > 0)
     {
@@ -790,7 +832,7 @@ void SampleLights(float3 hitPosGrid, float3 NGrid, float3 woGrid,
         if (SampleEmissiveLight(hitPosGrid, NGrid, seed, emLight))
         {
             directLight = emLight;
-            directLight.pdf = emLight.pdf * (emWeight / totalW);
+            directLight.pdf = emLight.pdf;  // 原始 PDF
         }
     }
 }
@@ -967,7 +1009,6 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed, out bool hitSk
             // 1. 统一光源采样（当前仅 HDR 环境光，未来自动混合多种光源）
             DirectLight directLight;
             SampleLights(hitPos, NGrid, woGrid, seed, directLight);
-
             // 2. 有效性检查
             float ndotl = dot(NGrid, directLight.direction);
             bool nextEventValid = (ndotl > 0.0f) && (directLight.pdf > 0.0f);

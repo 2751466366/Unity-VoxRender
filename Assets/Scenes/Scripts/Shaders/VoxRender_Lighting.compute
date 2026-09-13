@@ -1,0 +1,297 @@
+#pragma kernel CSMain
+
+// ============================================================
+//  Lighting 计算着色器（光照阶段）
+//
+//  读取 SVO G-Buffer（Albedo / Normal / WorldPos），
+//  参考 SVO_PathTracing.compute 的栈式 SVO 遍历实现阴影射线，
+//  做 Lambert + Ambient + 硬阴影合成。
+// ============================================================
+
+// ---- SVO 数据（由 SVOBuilder 上传） ----
+StructuredBuffer<uint4>   _SVONodes;
+StructuredBuffer<float4>  _SVOMaterials;
+
+float3 _SVORootMin;
+float  _SVOScale;
+int    _SVODepth;
+
+// ---- G-Buffer 纹理 ----
+Texture2D _AlbedoTex;
+Texture2D _NormalTex;
+Texture2D _WorldPosTex;
+SamplerState sampler_AlbedoTex;
+SamplerState sampler_NormalTex;
+SamplerState sampler_WorldPosTex;
+
+// ---- 光照参数 ----
+float3 _LightDir;
+float3 _LightColor;
+float  _Ambient;
+
+// ---- 相机参数 ----
+float4x4 _InverseVP;
+float3   _CameraPos;
+
+// ---- 天空盒 ----
+TextureCube _SkyboxTex;
+SamplerState sampler_SkyboxTex;
+float _HasSkyCube;
+float3 _SkyColor;
+
+// ---- 输出 ----
+RWTexture2D<float4> _LightingResult;
+
+// ---- 常量 ----
+static const float EPSILON  = 1e-6f;
+static const float INFINITE = 1e30f;
+
+// ============================================================
+//  天空采样
+// ============================================================
+float3 SampleSky(float3 dir)
+{
+    return (_HasSkyCube > 0.5f)
+        ? _SkyboxTex.SampleLevel(sampler_SkyboxTex, dir, 0).rgb
+        : _SkyColor;
+}
+
+// ============================================================
+//  网格空间方向 → 世界空间方向
+// ============================================================
+float3 GridDirToWorld(float3 gridD)
+{
+    return normalize(gridD);
+}
+
+// ============================================================
+//  栈元素结构体（用于 SVO 阴影射线遍历）
+// ============================================================
+struct SVOStackItem
+{
+    int   nodeIdx;
+    int   level;
+    int3  nodeMin;
+    float tMin;
+    float tMax;
+};
+
+// ============================================================
+//  栈式 SVO 阴影射线可见性测试
+//  参考 SVO_PathTracing.compute ShadowRayVisible_SVO
+//
+//  roGrid:     阴影射线起点（网格空间）
+//  lightDirGrid: 光源方向（网格空间，已归一化）
+//  skipVoxel:  主射线命中体素坐标（防自遮挡）
+//  maxT:       最大检测距离（方向光 = INFINITE）
+//  返回 true = 光源可见（未被遮挡）
+// ============================================================
+bool ShadowRayVisible_SVO(float3 roGrid, float3 lightDirGrid, int3 skipVoxel, float maxT)
+{
+    float rootSide = exp2((float)_SVODepth);
+
+    float3 rdInv = float3(
+        abs(lightDirGrid.x) > EPSILON ? 1.0 / lightDirGrid.x : (lightDirGrid.x >= 0.0 ? 1e30 : -1e30),
+        abs(lightDirGrid.y) > EPSILON ? 1.0 / lightDirGrid.y : (lightDirGrid.y >= 0.0 ? 1e30 : -1e30),
+        abs(lightDirGrid.z) > EPSILON ? 1.0 / lightDirGrid.z : (lightDirGrid.z >= 0.0 ? 1e30 : -1e30)
+    );
+
+    float3 t0 = -roGrid * rdInv;
+    float3 t1 = (rootSide - roGrid) * rdInv;
+    float3 tMin3 = min(t0, t1);
+    float3 tMax3 = max(t0, t1);
+    float tEnter = max(max(tMin3.x, tMin3.y), tMin3.z);
+    float tExit  = min(min(tMax3.x, tMax3.y), tMax3.z);
+
+    if (tEnter > tExit || tExit < 0.0)
+        return false;
+
+    tEnter = max(tEnter, 0.0);
+    if (tEnter > maxT)
+        return true;
+
+    // 栈
+    SVOStackItem stack[64];
+    int sp = 0;
+
+    stack[sp].nodeIdx = 0;
+    stack[sp].level   = _SVODepth;
+    stack[sp].nodeMin = int3(0, 0, 0);
+    stack[sp].tMin    = tEnter;
+    stack[sp].tMax    = min(tExit, maxT);
+    sp++;
+
+    while (sp > 0)
+    {
+        sp--;
+        SVOStackItem cur = stack[sp];
+
+        if (cur.tMin > maxT)
+            return true;
+
+        uint4 node = _SVONodes[cur.nodeIdx];
+        uint childMask = node.x;
+        uint data      = node.y;
+        uint flags     = node.z;
+
+        // 叶子节点
+        if ((flags & 256u) != 0u)
+        {
+            float voxelSizeF = float(1 << cur.level);
+            float3 voxelMin = float3(cur.nodeMin);
+            float3 voxelMax = voxelMin + voxelSizeF;
+
+            bool containsSkip = all(skipVoxel >= cur.nodeMin) &&
+                                all(skipVoxel <  cur.nodeMin + int(1 << cur.level));
+            bool roInsideLeaf = all(roGrid >= voxelMin) && all(roGrid < voxelMax);
+
+            if (containsSkip || roInsideLeaf)
+                continue;
+
+            return false; // 命中实体 = 被遮挡
+        }
+
+        // 内部节点：收集非空子节点
+        int half = 1 << (cur.level - 1);
+        float fHalf = float(half);
+        float3 fNodeMin = float3(cur.nodeMin);
+
+        float childTMin[4];
+        float childTMax[4];
+        int   childNodeIdx[4];
+        int   childLevel[4];
+        int3  childMin[4];
+        int   childCount = 0;
+
+        [unroll]
+        for (int i = 0; i < 8; i++)
+        {
+            if ((childMask & (1u << i)) == 0u)
+                continue;
+
+            int cx = i & 1;
+            int cy = (i >> 1) & 1;
+            int cz = (i >> 2) & 1;
+
+            float3 cMinF = fNodeMin + float3(cx * fHalf, cy * fHalf, cz * fHalf);
+            float3 cMaxF = cMinF + fHalf;
+
+            float3 cT0 = (cMinF - roGrid) * rdInv;
+            float3 cT1 = (cMaxF - roGrid) * rdInv;
+            float3 cTMin3 = min(cT0, cT1);
+            float3 cTMax3 = max(cT0, cT1);
+            float cTMin = max(max(cTMin3.x, cTMin3.y), cTMin3.z);
+            float cTMax = min(min(cTMax3.x, cTMax3.y), cTMax3.z);
+
+            cTMin = max(cTMin, cur.tMin);
+            cTMax = min(cTMax, cur.tMax);
+
+            if (cTMin <= cTMax && cTMax >= 0.0 && cTMin <= maxT)
+            {
+                childTMin[childCount]    = cTMin;
+                childTMax[childCount]    = cTMax;
+                childNodeIdx[childCount] = (int)data + i;
+                childLevel[childCount]   = cur.level - 1;
+                childMin[childCount]     = cur.nodeMin + int3(cx * half, cy * half, cz * half);
+                childCount++;
+            }
+        }
+
+        if (childCount > 1)
+        {
+            for (int a = 0; a < childCount - 1; a++)
+            {
+                for (int b = a + 1; b < childCount; b++)
+                {
+                    if (childTMin[a] < childTMin[b])
+                    {
+                        float tmpF = childTMin[a]; childTMin[a] = childTMin[b]; childTMin[b] = tmpF;
+                        tmpF = childTMax[a]; childTMax[a] = childTMax[b]; childTMax[b] = tmpF;
+                        int tmpI = childNodeIdx[a]; childNodeIdx[a] = childNodeIdx[b]; childNodeIdx[b] = tmpI;
+                        tmpI = childLevel[a]; childLevel[a] = childLevel[b]; childLevel[b] = tmpI;
+                        int3 tmpM = childMin[a]; childMin[a] = childMin[b]; childMin[b] = tmpM;
+                    }
+                }
+            }
+        }
+
+        for (int k = 0; k < childCount; k++)
+        {
+            if (sp < 64)
+            {
+                stack[sp].nodeIdx = childNodeIdx[k];
+                stack[sp].level   = childLevel[k];
+                stack[sp].nodeMin = childMin[k];
+                stack[sp].tMin    = childTMin[k];
+                stack[sp].tMax    = childTMax[k];
+                sp++;
+            }
+        }
+    }
+
+    return true;
+}
+
+// ============================================================
+//  CSMain — 每像素读取 G-Buffer + SVO 阴影 + 光照合成
+// ============================================================
+[numthreads(8, 8, 1)]
+void CSMain(uint3 dtid : SV_DispatchThreadID)
+{
+    uint2 pixel = dtid.xy;
+    uint2 dims;
+    _LightingResult.GetDimensions(dims.x, dims.y);
+    if (pixel.x >= dims.x || pixel.y >= dims.y) return;
+
+    // ---- 读取 G-Buffer ----
+    float2 uv = (float2(pixel) + 0.5) / float2(dims);
+    float4 albedo       = _AlbedoTex.SampleLevel(sampler_AlbedoTex, uv, 0);
+    float4 normalPacked = _NormalTex.SampleLevel(sampler_NormalTex, uv, 0);
+    float4 worldPosTex  = _WorldPosTex.SampleLevel(sampler_WorldPosTex, uv, 0);
+
+    // ---- 无体素命中 → 采样天空 ----
+    if (albedo.a < 0.01)
+    {
+        // 通过 normal.w 判断：0.5 = 相机在体素内部
+        if (abs(normalPacked.w - 0.5) < 0.2)
+        {
+            _LightingResult[pixel] = float4(0.0, 0.0, 0.0, 1.0);
+            return;
+        }
+
+        // 背景 → 采样天空
+        float4 clipPos = float4(uv * 2.0 - 1.0, 1.0, 1.0);
+        float4 farWorld = mul(_InverseVP, clipPos);
+        farWorld /= farWorld.w;
+        float3 rd = normalize(farWorld.xyz - _CameraPos);
+        _LightingResult[pixel] = float4(SampleSky(rd), 1.0);
+        return;
+    }
+
+    // ---- 解码法线 ----
+    float3 normal = normalPacked.xyz * 2.0 - 1.0;
+    normal = normalize(normal);
+
+    // ---- 从 WorldPos 反算体素坐标（用于阴影射线 skipVoxel） ----
+    float3 worldPos = worldPosTex.xyz;
+    float3 hitPosGrid = worldPos - _SVORootMin;  // 不除以 scale
+    int3 hitVoxel = int3(floor(hitPosGrid));
+
+    // ---- 阴影射线（SVO 栈式遍历） ----
+    float3 shadowRoGrid = float3(hitVoxel) + 0.5;
+    float3 lightDirGrid = normalize(_LightDir); // SVO 网格空间轴方向与世界空间一致
+    bool visible = ShadowRayVisible_SVO(shadowRoGrid, lightDirGrid, hitVoxel, INFINITE);
+
+    // ---- Lambert + Ambient + 阴影 ----
+    float ndotl = max(0.0, dot(normal, _LightDir));
+    float3 diffuse = albedo.rgb * _LightColor * ndotl;
+    float3 ambient = albedo.rgb * _Ambient;
+
+    float3 finalColor;
+    if (visible)
+        finalColor = diffuse + ambient;
+    else
+        finalColor = ambient;
+
+    _LightingResult[pixel] = float4(finalColor, 1.0);
+}

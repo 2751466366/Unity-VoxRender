@@ -1,17 +1,17 @@
 using UnityEngine;
-using UnityEngine.Rendering;
 
 /// <summary>
-/// Built-in RP 延迟渲染管线（挂载到 Camera 上）。
+/// Built-in RP 两阶段延迟渲染管线（挂载到 Camera 上）。
 ///
-/// Pass 1 (G-Buffer): CommandBuffer 在 CameraEvent.BeforeImageEffects 执行，
-///   将所有 VoxDataProvider 管理的 chunk 用 MRT 渲染到 albedo / normal / worldPos 三张 RT。
-/// Pass 2 (Shadow):   预留，等 SVO 构建完成后在 G-Buffer 和 Lighting 之间插入。
-/// Pass 3 (Lighting): OnRenderImage 中全屏 Blit，读取 G-Buffer 做 Lambert + ambient 合成。
+/// 仅保留两种渲染模式：
+///   RayTracing  — 两阶段 SVO 延迟渲染：
+///     Stage 1 (GBuffer):   SVO_GBuffer.compute 遍历 SVO，写入 Albedo/Normal/WorldPos
+///     Stage 2 (Lighting):  VoxRender_Lighting.compute 读 GBuffer + SVO 阴影射线 + 光照合成
+///   PathTracing — SVO 路径追踪（多弹射、NEE、MIS）
 ///
 /// 使用方式：
 ///   1. 将本组件挂到 Main Camera 上
-///   2. VoxModel 的 chunk3DMaterial 使用 Unlit/VoxRender_GBuffer 材质
+///   2. 拖入 SVO_GBuffer.compute 和 VoxRender_Lighting shader
 ///   3. 场景中放一个 Directional Light
 /// </summary>
 // [ExecuteInEditMode]
@@ -21,14 +21,14 @@ public class CameraRender : MonoBehaviour
     [Range(0f, 1f)] public float ambient = 0.2f;
 
     [Header("Debug")]
-    [Tooltip("在 Game 视图中显示 G-Buffer 各通道而非最终光照结果")]
-    public DebugView debugView = DebugView.Final;
+    [Tooltip("渲染模式")]
+    public DebugView debugView = DebugView.RayTracing;
 
-    [Tooltip("SVO 射线遍历计算着色器（拖入 SVO_RayCast.compute）")]
-    public ComputeShader svoRayCast;
+    [Tooltip("SVO GBuffer 计算着色器（拖入 SVO_GBuffer.compute）")]
+    public ComputeShader svoGBuffer;
 
-    [Tooltip("SVO 光线追踪计算着色器（拖入 SVO_RayTracing.compute）")]
-    public ComputeShader svoRayTracing;
+    [Tooltip("SVO 光照计算着色器（拖入 VoxRender_Lighting.compute）")]
+    public ComputeShader svoLighting;
 
     [Tooltip("SVO 路径追踪计算着色器（拖入 SVO_PathTracing.compute）")]
     public ComputeShader svoPathTracing;
@@ -38,28 +38,14 @@ public class CameraRender : MonoBehaviour
 
     public enum DebugView
     {
-        Final,
-        Albedo,
-        Normal,
-        WorldPos,
-        SVOVisual,
         RayTracing,
         PathTracing,
     }
 
     private Camera cam;
-    private CommandBuffer gBufferCmd;
-    private Material lightingMat;
-    private Material blendMat;  // SVO 混合材质
 
     // SVO 构建状态
     private bool svoBuilt = false;
-
-    // SVO 可视化 RT（OnPreRender 中渲染，OnRenderImage 中 Blit）
-    private RenderTexture svoVisRT;
-
-    // SVO 光线追踪 RT
-    private RenderTexture rayTracingRT;
 
     // SVO 路径追踪 RT
     private RenderTexture pathTracingRT;
@@ -67,10 +53,13 @@ public class CameraRender : MonoBehaviour
     private Matrix4x4 prevViewMatrix;
     private Matrix4x4 prevProjMatrix;
 
-    // G-Buffer RenderTextures
-    private RenderTexture gBufferAlbedo;    // RT0: RGBA32，深度 24-bit
+    // SVO G-Buffer RenderTextures（由 SVO_GBuffer.compute 写入）
+    private RenderTexture gBufferAlbedo;    // RT0: ARGB32
     private RenderTexture gBufferNormal;    // RT1: ARGBHalf
     private RenderTexture gBufferWorldPos;  // RT2: ARGBHalf
+
+    // SVO Lighting 输出 RT
+    private RenderTexture lightingRT;
 
     // Shader property IDs
     private static readonly int AlbedoTexID   = Shader.PropertyToID("_AlbedoTex");
@@ -81,7 +70,6 @@ public class CameraRender : MonoBehaviour
     private static readonly int LightColorID  = Shader.PropertyToID("_LightColor");
     private static readonly int SkyboxTexID   = Shader.PropertyToID("_SkyboxTex");
     private static readonly int InverseVPID   = Shader.PropertyToID("_InverseVP");
-    private static readonly int SVOResultID   = Shader.PropertyToID("_SVOResult");
 
     void OnEnable()
     {
@@ -91,56 +79,20 @@ public class CameraRender : MonoBehaviour
             Debug.LogError("[CameraRender] 必须挂载到 Camera 上");
             return;
         }
-
-        // 创建光照材质
-        Shader lightingShader = Shader.Find("Hidden/VoxRender_Lighting");
-        if (lightingShader == null)
-        {
-            Debug.LogError("[CameraRender] 未找到 Hidden/VoxRender_Lighting shader");
-            return;
-        }
-        lightingMat = new Material(lightingShader);
-        lightingMat.name = "DeferredLighting";
-
-        // 创建 SVO 混合材质
-        Shader blendShader = Shader.Find("Hidden/SVOBlend");
-        if (blendShader != null)
-        {
-            blendMat = new Material(blendShader);
-            blendMat.name = "SVOBlend";
-        }
-
-        // 创建 CommandBuffer（先移除旧的，防止重编译后重复添加）
-        if (gBufferCmd != null)
-            cam.RemoveCommandBuffer(CameraEvent.BeforeImageEffects, gBufferCmd);
-
-        gBufferCmd = new CommandBuffer { name = "Vox Deferred G-Buffer" };
-        cam.AddCommandBuffer(CameraEvent.BeforeImageEffects, gBufferCmd);
     }
 
     void OnDisable()
     {
-        if (cam != null && gBufferCmd != null)
-            cam.RemoveCommandBuffer(CameraEvent.BeforeImageEffects, gBufferCmd);
-
         ReleaseRTs();
         SVOBuilder.Release();
         svoBuilt = false;
 
-        if (svoVisRT != null)
+        if (lightingRT != null)
         {
-            svoVisRT.Release();
-            if (Application.isPlaying) Destroy(svoVisRT);
-            else DestroyImmediate(svoVisRT);
-            svoVisRT = null;
-        }
-
-        if (rayTracingRT != null)
-        {
-            rayTracingRT.Release();
-            if (Application.isPlaying) Destroy(rayTracingRT);
-            else DestroyImmediate(rayTracingRT);
-            rayTracingRT = null;
+            lightingRT.Release();
+            if (Application.isPlaying) Destroy(lightingRT);
+            else DestroyImmediate(lightingRT);
+            lightingRT = null;
         }
 
         if (pathTracingRT != null)
@@ -149,20 +101,6 @@ public class CameraRender : MonoBehaviour
             if (Application.isPlaying) Destroy(pathTracingRT);
             else DestroyImmediate(pathTracingRT);
             pathTracingRT = null;
-        }
-
-        if (lightingMat != null)
-        {
-            if (Application.isPlaying) Destroy(lightingMat);
-            else DestroyImmediate(lightingMat);
-            lightingMat = null;
-        }
-
-        if (blendMat != null)
-        {
-            if (Application.isPlaying) Destroy(blendMat);
-            else DestroyImmediate(blendMat);
-            blendMat = null;
         }
     }
 
@@ -173,24 +111,13 @@ public class CameraRender : MonoBehaviour
 
         if (debugView == DebugView.RayTracing)
         {
-            SetChunkRenderersEnabled(false);
             if (svoBuilt)
-                DispatchSVORayTracingPre();
+                DispatchSVOGBuffer();
         }
         else if (debugView == DebugView.PathTracing)
         {
-            SetChunkRenderersEnabled(false);
             if (svoBuilt)
                 DispatchSVOPathTracingPre();
-        }
-        else
-        {
-            // 其他模式：恢复 chunk cube 渲染，走 GBuffer 管线
-            SetChunkRenderersEnabled(true);
-            RebuildCommandBuffer();
-
-            if (debugView == DebugView.SVOVisual && svoBuilt)
-                DispatchSVORayCastPre();
         }
     }
 
@@ -214,7 +141,7 @@ public class CameraRender : MonoBehaviour
         svoBuilt = true;
     }
 
-    /// <summary>确保 G-Buffer RT 与屏幕分辨率一致，变化时重建。</summary>
+    /// <summary>确保 G-Buffer RT 和 Lighting RT 与屏幕分辨率一致，变化时重建。</summary>
     void EnsureRTs()
     {
         if (cam == null) return;
@@ -227,21 +154,31 @@ public class CameraRender : MonoBehaviour
 
         ReleaseRTs();
 
-        // 第一张 RT 带 24-bit 深度，供所有 MRT 共享
-        gBufferAlbedo = new RenderTexture(w, h, 24, RenderTextureFormat.ARGB32);
-        gBufferAlbedo.name = "GBuffer_Albedo";
+        // SVO GBuffer RTs（由 compute shader 写入，不需要深度缓冲）
+        gBufferAlbedo = new RenderTexture(w, h, 0, RenderTextureFormat.ARGB32);
+        gBufferAlbedo.name = "SVO_GBuffer_Albedo";
         gBufferAlbedo.filterMode = FilterMode.Point;
+        gBufferAlbedo.enableRandomWrite = true;
         gBufferAlbedo.Create();
 
         gBufferNormal = new RenderTexture(w, h, 0, RenderTextureFormat.ARGBHalf);
-        gBufferNormal.name = "GBuffer_Normal";
+        gBufferNormal.name = "SVO_GBuffer_Normal";
         gBufferNormal.filterMode = FilterMode.Point;
+        gBufferNormal.enableRandomWrite = true;
         gBufferNormal.Create();
 
         gBufferWorldPos = new RenderTexture(w, h, 0, RenderTextureFormat.ARGBHalf);
-        gBufferWorldPos.name = "GBuffer_WorldPos";
+        gBufferWorldPos.name = "SVO_GBuffer_WorldPos";
         gBufferWorldPos.filterMode = FilterMode.Point;
+        gBufferWorldPos.enableRandomWrite = true;
         gBufferWorldPos.Create();
+
+        // Lighting 输出 RT
+        lightingRT = new RenderTexture(w, h, 0, RenderTextureFormat.ARGBFloat);
+        lightingRT.name = "Lighting_Result";
+        lightingRT.filterMode = FilterMode.Point;
+        lightingRT.enableRandomWrite = true;
+        lightingRT.Create();
     }
 
     /// <summary>释放所有 G-Buffer RT。</summary>
@@ -259,26 +196,6 @@ public class CameraRender : MonoBehaviour
         if (Application.isPlaying) Destroy(rt);
         else DestroyImmediate(rt);
         rt = null;
-    }
-
-    /// <summary>每帧重建 CommandBuffer：设置 MRT、清除、绘制所有 chunk。</summary>
-    void RebuildCommandBuffer()
-    {
-        if (gBufferCmd == null || gBufferAlbedo == null || gBufferNormal == null || gBufferWorldPos == null)
-            return;
-
-        gBufferCmd.Clear();
-
-        // 设置 MRT（3 个颜色目标 + 共享深度）
-        gBufferCmd.SetRenderTarget(
-            new RenderTargetIdentifier[] { gBufferAlbedo, gBufferNormal, gBufferWorldPos },
-            gBufferAlbedo
-        );
-        gBufferCmd.ClearRenderTarget(true, true, Color.clear);
-
-        // 遍历 VoxDataProvider 中所有活跃的资产
-        var provider = VoxDataProvider.Instance;
-        if (provider == null) return;
     }
 
     /// <summary>查找场景中第一个启用的 Directional Light，设置光照参数。</summary>
@@ -300,172 +217,127 @@ public class CameraRender : MonoBehaviour
             }
         }
 
-        lightingMat.SetVector(LightDirID, lightDir);
-        lightingMat.SetVector(LightColorID, lightColor);
-        lightingMat.SetFloat(AmbientID, ambient);
+        if (svoLighting != null)
+        {
+            svoLighting.SetVector(LightDirID, lightDir);
+            svoLighting.SetVector(LightColorID, lightColor);
+            svoLighting.SetFloat(AmbientID, ambient);
+        }
     }
 
     void OnRenderImage(RenderTexture src, RenderTexture dest)
     {
-        if (lightingMat == null || gBufferAlbedo == null)
+        if (gBufferAlbedo == null)
         {
-            // 管线未就绪，直接输出
             Graphics.Blit(src, dest);
             return;
         }
 
-        // G-Buffer 已由 CommandBuffer 在 BeforeImageEffects 渲染完毕
-
-        switch (debugView)
+        if (debugView == DebugView.RayTracing)
         {
-            case DebugView.Albedo:
-                Graphics.Blit(gBufferAlbedo, dest);
-                break;
-            case DebugView.Normal:
-                Graphics.Blit(gBufferNormal, dest);
-                break;
-            case DebugView.WorldPos:
-                Graphics.Blit(gBufferWorldPos, dest);
-                break;
-            case DebugView.SVOVisual:
-                if (svoVisRT != null && blendMat != null)
-                {
-                    // 1:1 混合：先渲染默认光照到临时 RT，再与 SVO 可视化混合
-                    RenderTexture lightingRT = RenderTexture.GetTemporary(src.width, src.height, 0, src.format);
-                    
-                    // 渲染默认光照
-                    SetLightParameters();
-                    lightingMat.SetTexture(AlbedoTexID, gBufferAlbedo);
-                    lightingMat.SetTexture(NormalTexID, gBufferNormal);
-                    lightingMat.SetTexture(WorldPosTexID, gBufferWorldPos);
+            // ===== Stage 2: Lighting（计算着色器） =====
+            if (svoLighting == null || lightingRT == null)
+            {
+                Graphics.Blit(src, dest);
+                return;
+            }
 
-                    Cubemap sky2 = null;
-                    var skybox2 = cam.GetComponent<Skybox>();
-                    if (skybox2 != null && skybox2.material != null && skybox2.material.HasProperty("_Tex"))
-                        sky2 = skybox2.material.GetTexture("_Tex") as Cubemap;
-                    if (sky2 == null && RenderSettings.skybox != null && RenderSettings.skybox.HasProperty("_Tex"))
-                        sky2 = RenderSettings.skybox.GetTexture("_Tex") as Cubemap;
-                    if (sky2 != null)
-                        lightingMat.SetTexture(SkyboxTexID, sky2);
+            int kernel = svoLighting.FindKernel("CSMain");
+            if (kernel < 0)
+            {
+                Debug.LogError("[Lighting] 计算着色器找不到 CSMain kernel");
+                Graphics.Blit(src, dest);
+                return;
+            }
 
-                    Matrix4x4 vp2 = GL.GetGPUProjectionMatrix(cam.projectionMatrix, false) * cam.worldToCameraMatrix;
-                    lightingMat.SetMatrix(InverseVPID, vp2.inverse);
+            int w = cam.pixelWidth;
+            int h = cam.pixelHeight;
 
-                    Graphics.Blit(null, lightingRT, lightingMat);
-                    
-                    // 混合 SVO 和光照
-                    blendMat.SetTexture("_MainTex", svoVisRT);
-                    blendMat.SetTexture("_LightingTex", lightingRT);
-                    Graphics.Blit(null, dest, blendMat);
-                    
-                    RenderTexture.ReleaseTemporary(lightingRT);
-                }
-                else if (svoVisRT != null)
-                    Graphics.Blit(svoVisRT, dest);
-                else
-                    Graphics.Blit(src, dest);
-                break;
-            case DebugView.RayTracing:
-                if (rayTracingRT != null)
-                    Graphics.Blit(rayTracingRT, dest);
-                else
-                    Graphics.Blit(src, dest);
-                break;
-            case DebugView.PathTracing:
-                if (pathTracingRT != null)
-                    Graphics.Blit(pathTracingRT, dest);
-                else
-                    Graphics.Blit(src, dest);
-                break;
-            default:
-                // ===== Pass 3: 光照合成 =====
-                SetLightParameters();
-                lightingMat.SetTexture(AlbedoTexID, gBufferAlbedo);
-                lightingMat.SetTexture(NormalTexID, gBufferNormal);
-                lightingMat.SetTexture(WorldPosTexID, gBufferWorldPos);
+            // G-Buffer 纹理
+            svoLighting.SetTexture(kernel, "_AlbedoTex", gBufferAlbedo);
+            svoLighting.SetTexture(kernel, "_NormalTex", gBufferNormal);
+            svoLighting.SetTexture(kernel, "_WorldPosTex", gBufferWorldPos);
+            svoLighting.SetTexture(kernel, "_LightingResult", lightingRT);
 
-                // Skybox Cubemap：优先从相机 Skybox 组件取，其次从 Lighting Settings 取
-                // 只有 Skybox/Cubemap shader 有 _Tex 属性；Skybox/Procedural 等程序化 shader 没有 Cubemap 纹理，会跳过
-                Cubemap sky = null;
-                var skybox = cam.GetComponent<Skybox>();
-                if (skybox != null && skybox.material != null && skybox.material.HasProperty("_Tex"))
-                    sky = skybox.material.GetTexture("_Tex") as Cubemap;
-                if (sky == null && RenderSettings.skybox != null && RenderSettings.skybox.HasProperty("_Tex"))
-                    sky = RenderSettings.skybox.GetTexture("_Tex") as Cubemap;
-                if (sky != null)
-                    lightingMat.SetTexture(SkyboxTexID, sky);
+            // 相机参数
+            Matrix4x4 vp = GL.GetGPUProjectionMatrix(cam.projectionMatrix, false) * cam.worldToCameraMatrix;
+            svoLighting.SetMatrix("_InverseVP", vp.inverse);
+            svoLighting.SetVector("_CameraPos", cam.transform.position);
 
-                // Inverse VP 矩阵：裁剪空间 → 世界空间，用于重建屏幕射线采样 Skybox
-                Matrix4x4 vp = GL.GetGPUProjectionMatrix(cam.projectionMatrix, false) * cam.worldToCameraMatrix;
-                lightingMat.SetMatrix(InverseVPID, vp.inverse);
+            // 光照参数
+            SetLightParameters();
 
-                Graphics.Blit(null, dest, lightingMat);
-                break;
+            // 天空盒
+            Cubemap skyCubemap = null;
+            var skybox = cam.GetComponent<Skybox>();
+            if (skybox != null && skybox.material != null && skybox.material.HasProperty("_Tex"))
+                skyCubemap = skybox.material.GetTexture("_Tex") as Cubemap;
+            if (skyCubemap == null && RenderSettings.skybox != null && RenderSettings.skybox.HasProperty("_Tex"))
+                skyCubemap = RenderSettings.skybox.GetTexture("_Tex") as Cubemap;
+            if (skyCubemap != null)
+            {
+                svoLighting.SetTexture(kernel, "_SkyboxTex", skyCubemap);
+                svoLighting.SetFloat("_HasSkyCube", 1.0f);
+            }
+            else
+            {
+                svoLighting.SetFloat("_HasSkyCube", 0.0f);
+            }
+            svoLighting.SetVector("_SkyColor", new Vector3(0.15f, 0.25f, 0.85f));
+
+            // 调度
+            uint tgX, tgY, tgZ;
+            svoLighting.GetKernelThreadGroupSizes(kernel, out tgX, out tgY, out tgZ);
+            svoLighting.Dispatch(kernel, Mathf.CeilToInt(w / (float)tgX), Mathf.CeilToInt(h / (float)tgY), 1);
+
+            Graphics.Blit(lightingRT, dest);
+        }
+        else if (debugView == DebugView.PathTracing)
+        {
+            if (pathTracingRT != null)
+                Graphics.Blit(pathTracingRT, dest);
+            else
+                Graphics.Blit(src, dest);
+        }
+        else
+        {
+            Graphics.Blit(src, dest);
         }
     }
 
-    /// <summary>在 OnPreRender 中调度 SVO 射线遍历计算着色器，渲染到 svoVisRT。</summary>
-    void DispatchSVORayCastPre()
+    /// <summary>调度 SVO GBuffer 计算着色器（Stage 1：几何阶段）。</summary>
+    void DispatchSVOGBuffer()
     {
-        if (svoRayCast == null || cam == null) return;
+        if (svoGBuffer == null || cam == null) return;
 
         int w = cam.pixelWidth;
         int h = cam.pixelHeight;
         if (w <= 0 || h <= 0) return;
 
-        int kernel = svoRayCast.FindKernel("CSMain");
+        int kernel = svoGBuffer.FindKernel("CSMain");
         if (kernel < 0)
         {
-            Debug.LogError("[SVOVis] 计算着色器找不到 CSMain kernel");
+            Debug.LogError("[SVO_GBuffer] 计算着色器找不到 CSMain kernel");
             return;
-        }
-
-        // 创建或重建 RT
-        if (svoVisRT == null || svoVisRT.width != w || svoVisRT.height != h)
-        {
-            if (svoVisRT != null) { svoVisRT.Release(); Destroy(svoVisRT); }
-            svoVisRT = new RenderTexture(w, h, 0, RenderTextureFormat.ARGBFloat);
-            svoVisRT.enableRandomWrite = true;
-            svoVisRT.name = "SVOVis_RT";
-            svoVisRT.Create();
         }
 
         try
         {
             Matrix4x4 vp = GL.GetGPUProjectionMatrix(cam.projectionMatrix, false) * cam.worldToCameraMatrix;
-            svoRayCast.SetMatrix("_InverseVP", vp.inverse);
-            svoRayCast.SetVector("_CameraPos", cam.transform.position);
-            svoRayCast.SetTexture(kernel, "_SVOResult", svoVisRT);
+            svoGBuffer.SetMatrix("_InverseVP", vp.inverse);
+            svoGBuffer.SetVector("_CameraPos", cam.transform.position);
+            svoGBuffer.SetTexture(kernel, "_GBufferAlbedo", gBufferAlbedo);
+            svoGBuffer.SetTexture(kernel, "_GBufferNormal", gBufferNormal);
+            svoGBuffer.SetTexture(kernel, "_GBufferWorldPos", gBufferWorldPos);
 
             uint tgX, tgY, tgZ;
-            svoRayCast.GetKernelThreadGroupSizes(kernel, out tgX, out tgY, out tgZ);
-            svoRayCast.Dispatch(kernel, Mathf.CeilToInt(w / (float)tgX), Mathf.CeilToInt(h / (float)tgY), 1);
-
-            // 诊断日志（只打印一次）
-            if (!_svoVisLogged)
-            {
-                _svoVisLogged = true;
-                // 读取全局 SVO 参数
-                var rootMin = Shader.GetGlobalVector("_SVORootMin");
-                var scale = Shader.GetGlobalFloat("_SVOScale");
-                var depth = Shader.GetGlobalInt("_SVODepth");
-                Debug.Log($"[SVOVis] 诊断: _SVORootMin={rootMin}, _SVOScale={scale}, _SVODepth={depth}");
-                Debug.Log($"[SVOVis] 相机: pos={cam.transform.position}, forward={cam.transform.forward}");
-                Debug.Log($"[SVOVis] RT: {w}x{h}, kernel={kernel}, threadGroup=({tgX},{tgY},{tgZ})");
-            }
+            svoGBuffer.GetKernelThreadGroupSizes(kernel, out tgX, out tgY, out tgZ);
+            svoGBuffer.Dispatch(kernel, Mathf.CeilToInt(w / (float)tgX), Mathf.CeilToInt(h / (float)tgY), 1);
         }
         catch (System.Exception ex)
         {
-            Debug.LogError($"[SVOVis] 计算着色器调度失败: {ex.Message}");
+            Debug.LogError($"[SVO_GBuffer] 计算着色器调度失败: {ex.Message}");
         }
-    }
-
-    private bool _svoVisLogged = false;
-
-    /// <summary>启用/禁用所有 chunk 的渲染（已废弃，SVO 管线不再依赖 cube renderer）。</summary>
-    void SetChunkRenderersEnabled(bool enabled)
-    {
-        // SVO 管线不再依赖 chunk cube renderer，保留空方法以兼容调用点
     }
 
     /// <summary>在 OnPreRender 中调度 SVO 路径追踪计算着色器，渲染到 pathTracingRT。</summary>
@@ -494,6 +366,22 @@ public class CameraRender : MonoBehaviour
             pathTracingRT.enableRandomWrite = true;
             pathTracingRT.name = "PathTracing_RT";
             pathTracingRT.Create();
+        }
+
+        // 检测方向光
+        Vector3 sunDir = Vector3.up;
+        Vector3 sunColor = Vector3.zero;
+        bool hasSun = false;
+        var lights = FindObjectsOfType<Light>();
+        foreach (var l in lights)
+        {
+            if (l.type == LightType.Directional && l.isActiveAndEnabled)
+            {
+                sunDir = -l.transform.forward;
+                sunColor = ((Vector4)l.color * l.intensity);
+                hasSun = true;
+                break;
+            }
         }
 
         // 检测相机是否移动（移动时重置累积）
@@ -539,6 +427,11 @@ public class CameraRender : MonoBehaviour
             }
             svoPathTracing.SetVector("_SkyColor", skyColor);
 
+            // 方向光（太阳）
+            svoPathTracing.SetVector("_SunDir", sunDir);
+            svoPathTracing.SetVector("_SunColor", sunColor);
+            svoPathTracing.SetFloat("_HasSun", hasSun ? 1.0f : 0.0f);
+
             // 路径追踪参数
             svoPathTracing.SetInt("_MaxDepth", maxBounceDepth);
             svoPathTracing.SetInt("_FrameCount", pathTracingFrameCount);
@@ -552,85 +445,6 @@ public class CameraRender : MonoBehaviour
         catch (System.Exception ex)
         {
             Debug.LogError($"[PathTracing] 计算着色器调度失败: {ex.Message}");
-        }
-    }
-
-    /// <summary>在 OnPreRender 中调度 SVO 光线追踪计算着色器，渲染到 rayTracingRT。</summary>
-    void DispatchSVORayTracingPre()
-    {
-        if (svoRayTracing == null || cam == null) return;
-
-        int w = cam.pixelWidth;
-        int h = cam.pixelHeight;
-        if (w <= 0 || h <= 0) return;
-
-        int kernel = svoRayTracing.FindKernel("CSMain");
-        if (kernel < 0)
-        {
-            Debug.LogError("[RayTracing] 计算着色器找不到 CSMain kernel");
-            return;
-        }
-
-        // 创建或重建 RT
-        if (rayTracingRT == null || rayTracingRT.width != w || rayTracingRT.height != h)
-        {
-            if (rayTracingRT != null) { rayTracingRT.Release(); Destroy(rayTracingRT); }
-            rayTracingRT = new RenderTexture(w, h, 0, RenderTextureFormat.ARGBFloat);
-            rayTracingRT.enableRandomWrite = true;
-            rayTracingRT.name = "RayTracing_RT";
-            rayTracingRT.Create();
-        }
-
-        try
-        {
-            Matrix4x4 vp = GL.GetGPUProjectionMatrix(cam.projectionMatrix, false) * cam.worldToCameraMatrix;
-            svoRayTracing.SetMatrix("_InverseVP", vp.inverse);
-            svoRayTracing.SetVector("_CameraPos", cam.transform.position);
-            svoRayTracing.SetTexture(kernel, "_RayTracingResult", rayTracingRT);
-
-            // 光照参数
-            Vector3 lightDir = new Vector3(0.5f, 0.8f, 0.3f).normalized;
-            Vector3 lightColor = new Vector3(1f, 1f, 1f);
-            var lights = FindObjectsOfType<Light>();
-            foreach (var l in lights)
-            {
-                if (l.type == LightType.Directional && l.isActiveAndEnabled)
-                {
-                    lightDir = -l.transform.forward;
-                    lightColor = (Vector4)l.color * l.intensity;
-                    break;
-                }
-            }
-            svoRayTracing.SetVector("_LightDir", lightDir);
-            svoRayTracing.SetVector("_LightColor", lightColor);
-            svoRayTracing.SetFloat("_Ambient", ambient);
-
-            // 天空颜色：尝试将 Skybox Cubemap 传给计算着色器在 GPU 端采样
-            Vector3 skyColor = new Vector3(0.15f, 0.25f, 0.85f); // 回退默认蓝色
-            Cubemap skyCubemap = null;
-            var skybox = cam.GetComponent<Skybox>();
-            if (skybox != null && skybox.material != null && skybox.material.HasProperty("_Tex"))
-                skyCubemap = skybox.material.GetTexture("_Tex") as Cubemap;
-            if (skyCubemap == null && RenderSettings.skybox != null && RenderSettings.skybox.HasProperty("_Tex"))
-                skyCubemap = RenderSettings.skybox.GetTexture("_Tex") as Cubemap;
-            if (skyCubemap != null)
-            {
-                svoRayTracing.SetTexture(kernel, "_SkyboxTex", skyCubemap);
-                svoRayTracing.SetFloat("_HasSkyCube", 1.0f);
-            }
-            else
-            {
-                svoRayTracing.SetFloat("_HasSkyCube", 0.0f);
-            }
-            svoRayTracing.SetVector("_SkyColor", skyColor);
-
-            uint tgX, tgY, tgZ;
-            svoRayTracing.GetKernelThreadGroupSizes(kernel, out tgX, out tgY, out tgZ);
-            svoRayTracing.Dispatch(kernel, Mathf.CeilToInt(w / (float)tgX), Mathf.CeilToInt(h / (float)tgY), 1);
-        }
-        catch (System.Exception ex)
-        {
-            Debug.LogError($"[RayTracing] 计算着色器调度失败: {ex.Message}");
         }
     }
 }
