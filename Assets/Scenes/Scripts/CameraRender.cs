@@ -1,4 +1,7 @@
+using System;
+using System.Runtime.InteropServices;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 /// <summary>
 /// Built-in RP 两阶段延迟渲染管线（挂载到 Camera 上）。
@@ -36,6 +39,10 @@ public class CameraRender : MonoBehaviour
     [Header("Path Tracing")]
     [Range(1, 16)] public int maxBounceDepth = 4;
 
+    [Header("DLSS")]
+    [Tooltip("启用 DLSS 降噪（DLAA 模式，100% 渲染分辨率）；插件不可用时自动回退时域累积")]
+    public bool enableDLSS = true;
+
     public enum DebugView
     {
         RayTracing,
@@ -53,6 +60,24 @@ public class CameraRender : MonoBehaviour
     private Matrix4x4 prevViewMatrix;
     private Matrix4x4 prevProjMatrix;
 
+    // ---- DLSS 集成状态 ----
+    private bool dlssInitAttempted = false;   // INIT 仅尝试一次（失败不重试，避免拖垮帧率）
+    private bool dlssCreatePending = false;   // CREATE 事件已发出
+    private bool dlssNeedsReset = false;      // 下一帧 evaluate 带 reset（丢弃历史）
+    private bool dlssFailedLogged = false;    // 失败日志只打一次
+    private int  dlssState = DLSSInterop.StateNotInitialized;
+    private int  haltonIndex = 0;
+    private Matrix4x4 prevJitteredVP = Matrix4x4.identity;
+    private RenderTexture motionVectorRT;     // RGFloat：像素空间 MV
+    private RenderTexture depthRT;            // RFloat：hardware depth
+    private RenderTexture dlssOutputRT;       // ARGBFloat：DLSS 输出
+    private IntPtr dlssSearchPathPtr = IntPtr.Zero;  // 持久持有（NGX 可能保留指针）
+    private IntPtr dlssAppDataPtr    = IntPtr.Zero;
+    private IntPtr dlssInitDataPtr   = IntPtr.Zero;
+    private IntPtr dlssCreateDataPtr = IntPtr.Zero;
+    private readonly IntPtr[] dlssEvalBufs = new IntPtr[2]; // 双缓冲交替
+    private int dlssEvalBufIdx = 0;
+
     // SVO G-Buffer RenderTextures（由 SVO_GBuffer.compute 写入）
     private RenderTexture gBufferAlbedo;    // RT0: ARGB32
     private RenderTexture gBufferNormal;    // RT1: ARGBHalf
@@ -60,6 +85,9 @@ public class CameraRender : MonoBehaviour
 
     // SVO Lighting 输出 RT
     private RenderTexture lightingRT;
+
+    // DLSS keyword 变体（SVO_PathTracing.compute 的 multi_compile_local）
+    private const string DlssOnKeyword = "DLSS_ON";
 
     // Shader property IDs
     private static readonly int AlbedoTexID   = Shader.PropertyToID("_AlbedoTex");
@@ -79,10 +107,15 @@ public class CameraRender : MonoBehaviour
             Debug.LogError("[CameraRender] 必须挂载到 Camera 上");
             return;
         }
+
+        // 组件重新启用时允许 DLSS 重新初始化（OnDisable 已发 Shutdown）
+        dlssInitAttempted = false;
+        dlssFailedLogged = false;
     }
 
     void OnDisable()
     {
+        ReleaseDLSS();
         ReleaseRTs();
         SVOBuilder.Release();
         svoBuilt = false;
@@ -294,8 +327,11 @@ public class CameraRender : MonoBehaviour
         }
         else if (debugView == DebugView.PathTracing)
         {
-            if (pathTracingRT != null)
-                Graphics.Blit(pathTracingRT, dest);
+            // DLSS 就绪时展示重建输出；否则展示时域累积结果（回退）
+            RenderTexture presentRT = (dlssState == DLSSInterop.StateFeatureReady && dlssOutputRT != null)
+                ? dlssOutputRT : pathTracingRT;
+            if (presentRT != null)
+                Graphics.Blit(presentRT, dest);
             else
                 Graphics.Blit(src, dest);
         }
@@ -368,6 +404,12 @@ public class CameraRender : MonoBehaviour
             pathTracingRT.Create();
         }
 
+        // ---- DLSS 状态机推进（INIT → CREATE → READY，失败自动回退时域累积）----
+        AdvanceDLSSState(w, h, resolutionChanged);
+        bool useDLSS = enableDLSS && dlssState == DLSSInterop.StateFeatureReady
+                       && pathTracingRT.GetNativeTexturePtr() != IntPtr.Zero;
+        if (useDLSS) EnsureDLSSRTs(w, h);
+
         // 检测方向光
         Vector3 sunDir = Vector3.up;
         Vector3 sunColor = Vector3.zero;
@@ -384,13 +426,13 @@ public class CameraRender : MonoBehaviour
             }
         }
 
-        // 检测相机是否移动（移动时重置累积）
+        // 检测相机是否移动（仅回退路径需要重置累积；DLSS 由 MV 自处理）
         Matrix4x4 currentView = cam.worldToCameraMatrix;
         Matrix4x4 currentProj = cam.projectionMatrix;
         bool cameraMoved = (pathTracingFrameCount > 0) &&
             (currentView != prevViewMatrix || currentProj != prevProjMatrix);
 
-        if (cameraMoved || resolutionChanged)
+        if (!useDLSS && (cameraMoved || resolutionChanged))
         {
             pathTracingFrameCount = 0;
             // 清空 RT 以移除旧帧数据
@@ -401,12 +443,35 @@ public class CameraRender : MonoBehaviour
         prevViewMatrix = currentView;
         prevProjMatrix = currentProj;
 
+        // ---- Halton(2,3) 抖动 + jittered 投影矩阵（DLSS 路径；颜色/MV/深度共用同一投影）----
+        float jx = 0f, jy = 0f;
+        Matrix4x4 projMatrix = cam.projectionMatrix;
+        if (useDLSS)
+        {
+            int phase = haltonIndex % 8 + 1;
+            jx = Halton(phase, 2) - 0.5f;
+            jy = Halton(phase, 3) - 0.5f;
+            projMatrix.m02 += 2f * jx / w;   // 像素空间 jitter → NDC（z 斜率列）
+            projMatrix.m12 += 2f * jy / h;
+        }
+        haltonIndex++;
+
         try
         {
-            Matrix4x4 vp = GL.GetGPUProjectionMatrix(cam.projectionMatrix, false) * cam.worldToCameraMatrix;
+            Matrix4x4 vp = GL.GetGPUProjectionMatrix(projMatrix, false) * cam.worldToCameraMatrix;
             svoPathTracing.SetMatrix("_InverseVP", vp.inverse);
+            svoPathTracing.SetMatrix("_CurVP", vp);
+            svoPathTracing.SetMatrix("_PrevVP", prevJitteredVP);
             svoPathTracing.SetVector("_CameraPos", cam.transform.position);
+            // DLSS 变体切换：未启用时变体不含 MV/深度 UAV，无绑定要求（消除 not set 警告）
+            if (useDLSS) svoPathTracing.EnableKeyword(DlssOnKeyword);
+            else         svoPathTracing.DisableKeyword(DlssOnKeyword);
             svoPathTracing.SetTexture(kernel, "_PathTracingResult", pathTracingRT);
+            if (useDLSS)
+            {
+                svoPathTracing.SetTexture(kernel, "_MotionVectorRT", motionVectorRT);
+                svoPathTracing.SetTexture(kernel, "_DepthRT", depthRT);
+            }
 
             // 天空盒
             Vector3 skyColor = new Vector3(1.5f, 2.0f, 3.0f); // HDR 回退天空色（确保无 Cubemap 时仍有足够亮度）
@@ -441,10 +506,230 @@ public class CameraRender : MonoBehaviour
             svoPathTracing.Dispatch(kernel, Mathf.CeilToInt(w / (float)tgX), Mathf.CeilToInt(h / (float)tgY), 1);
 
             pathTracingFrameCount++;
+
+            // ---- DLSS evaluate（渲染线程执行，严格位于 dispatch 之后）----
+            if (useDLSS) IssueDLSSEvaluate(w, h, jx, jy);
+
+            prevJitteredVP = vp;
         }
         catch (System.Exception ex)
         {
             Debug.LogError($"[PathTracing] 计算着色器调度失败: {ex.Message}");
         }
+    }
+
+    // ============================================================
+    //  DLSS 集成（NGX DLSS-SR / DLAA）
+    //  原则：任何一层失败都只降级不崩溃，渲染照常走时域累积回退
+    // ============================================================
+
+    static float Halton(int index, int b)
+    {
+        float f = 1f, r = 0f;
+        while (index > 0)
+        {
+            f /= b;
+            r += f * (index % b);
+            index /= b;
+        }
+        return r;
+    }
+
+    int SafeGetDLSSState()
+    {
+        try { return DLSSInterop.DLSS_GetState(); }
+        catch (Exception) { return DLSSInterop.StateInitFailed; }
+    }
+
+    /// <summary>推进 DLSS 状态机（INIT → CREATE → READY）。</summary>
+    void AdvanceDLSSState(int w, int h, bool resolutionChanged)
+    {
+        if (!enableDLSS) return;
+
+        // 1. 首次：发 INIT 事件（仅一次，失败不重试）
+        if (!dlssInitAttempted)
+        {
+            dlssInitAttempted = true;
+            TryInitDLSS();
+            return; // 状态下一帧可见
+        }
+
+        dlssState = SafeGetDLSSState();
+
+        // 2. 失败 → 提示一次，之后静默回退（useDLSS 判定已排除）
+        if (dlssState < 0)
+        {
+            if (!dlssFailedLogged)
+            {
+                dlssFailedLogged = true;
+                Debug.LogWarning($"[DLSS] 不可用(state={dlssState}): {DLSSInterop.GetLastMessageManaged()} → 回退时域累积");
+            }
+            return;
+        }
+
+        // 3. INIT 成功 → 创建 feature（一次；DLAA：输入=输出=全分辨率）
+        if (dlssState == DLSSInterop.StateInitSucceeded && !dlssCreatePending)
+        {
+            dlssCreatePending = true;
+            IssueDLSSCreate(w, h);
+        }
+
+        // 4. 分辨率变化 → 下一帧 evaluate 带 reset
+        if (resolutionChanged) dlssNeedsReset = true;
+    }
+
+    void TryInitDLSS()
+    {
+        try
+        {
+            if (DLSSInterop.DLSS_GetRenderEventFunc() == IntPtr.Zero)
+            {
+                dlssState = DLSSInterop.StateInitFailed;
+                Debug.LogWarning("[DLSS] DLSS_GetRenderEventFunc 返回空");
+                return;
+            }
+
+            // NGX 可能保留路径指针 → 持久 HGlobal（ReleaseDLSS 释放）
+            dlssSearchPathPtr = DLSSInterop.AllocWideString(Application.dataPath + "/Plugins/x86_64");
+            dlssAppDataPtr    = DLSSInterop.AllocWideString(Application.temporaryCachePath);
+            var init = new DLSSInterop.InitData
+            {
+                dllSearchPath = dlssSearchPathPtr,
+                appDataPath   = dlssAppDataPtr,
+                appId         = 0x00564F58UL, // "VOX"
+            };
+            dlssInitDataPtr = DLSSInterop.AllocStruct(ref init);
+
+            var cb = new CommandBuffer { name = "DLSS Init" };
+            DLSSInterop.IssuePluginEvent(cb, DLSSInterop.EventInit, dlssInitDataPtr);
+            Graphics.ExecuteCommandBuffer(cb);
+            cb.Dispose();
+        }
+        catch (DllNotFoundException)        { dlssState = DLSSInterop.StateInitFailed; Debug.LogWarning("[DLSS] DLSSPlugin.dll 未找到 → 回退时域累积"); }
+        catch (EntryPointNotFoundException) { dlssState = DLSSInterop.StateInitFailed; Debug.LogWarning("[DLSS] DLSSPlugin 导出符号不匹配 → 回退时域累积"); }
+        catch (Exception ex)                { dlssState = DLSSInterop.StateInitFailed; Debug.LogWarning("[DLSS] 初始化异常: " + ex.Message); }
+    }
+
+    void IssueDLSSCreate(int w, int h)
+    {
+        try
+        {
+            var create = new DLSSInterop.CreateData
+            {
+                inputWidth   = (uint)w,
+                inputHeight  = (uint)h,
+                outputWidth  = (uint)w,   // DLAA：1:1，仅降噪 + AA
+                outputHeight = (uint)h,
+                perfQuality  = DLSSInterop.QualityDLAA,
+                featureFlags = DLSSInterop.FlagIsHDR | DLSSInterop.FlagMVJittered,
+            };
+            if (dlssCreateDataPtr == IntPtr.Zero) dlssCreateDataPtr = DLSSInterop.AllocStruct(ref create);
+            else DLSSInterop.WriteStruct(dlssCreateDataPtr, ref create);
+
+            var cb = new CommandBuffer { name = "DLSS CreateFeature" };
+            DLSSInterop.IssuePluginEvent(cb, DLSSInterop.EventCreateFeature, dlssCreateDataPtr);
+            Graphics.ExecuteCommandBuffer(cb);
+            cb.Dispose();
+            dlssNeedsReset = true; // 创建后首帧丢弃历史
+        }
+        catch (Exception ex) { Debug.LogWarning("[DLSS] CreateFeature 异常: " + ex.Message); }
+    }
+
+    void IssueDLSSEvaluate(int w, int h, float jx, float jy)
+    {
+        var eval = new DLSSInterop.EvalData
+        {
+            color         = pathTracingRT.GetNativeTexturePtr(),
+            motionVectors = motionVectorRT.GetNativeTexturePtr(),
+            depth         = depthRT.GetNativeTexturePtr(),
+            output        = dlssOutputRT.GetNativeTexturePtr(),
+            jitterX       = -jx,
+            jitterY       = -jy,
+            mvScaleX      = 1f,  // shader 已输出像素单位 MV
+            mvScaleY      = 1f,
+            subrectWidth  = (uint)w,
+            subrectHeight = (uint)h,
+            reset         = dlssNeedsReset ? 1 : 0,
+        };
+        dlssNeedsReset = false;
+
+        // 双缓冲交替，渲染线程读取与下一帧主线程覆写不重叠（缓冲懒分配）
+        int idx = 1 - dlssEvalBufIdx;
+        if (dlssEvalBufs[idx] == IntPtr.Zero)
+            dlssEvalBufs[idx] = DLSSInterop.AllocStruct(ref eval);
+        else
+            DLSSInterop.WriteStruct(dlssEvalBufs[idx], ref eval);
+        dlssEvalBufIdx = idx;
+
+        var cb = new CommandBuffer { name = "DLSS Evaluate" };
+        DLSSInterop.IssuePluginEvent(cb, DLSSInterop.EventEvaluate, dlssEvalBufs[dlssEvalBufIdx]);
+        Graphics.ExecuteCommandBuffer(cb);
+        cb.Dispose();
+    }
+
+    /// <summary>确保 DLSS 附加 RT（MV/深度/输出）与屏幕分辨率一致。</summary>
+    void EnsureDLSSRTs(int w, int h)
+    {
+        if (motionVectorRT != null && motionVectorRT.width == w && motionVectorRT.height == h &&
+            depthRT != null && dlssOutputRT != null)
+            return;
+
+        ReleaseRT(ref motionVectorRT);
+        ReleaseRT(ref depthRT);
+        ReleaseRT(ref dlssOutputRT);
+
+        // RGFloat(R32G32F)与 shader 的 RWTexture2D<float2> UAV 格式精确匹配
+        motionVectorRT = new RenderTexture(w, h, 0, RenderTextureFormat.RGFloat);
+        motionVectorRT.name = "DLSS_MotionVectors";
+        motionVectorRT.filterMode = FilterMode.Point;
+        motionVectorRT.enableRandomWrite = true;
+        motionVectorRT.Create();
+
+        depthRT = new RenderTexture(w, h, 0, RenderTextureFormat.RFloat);
+        depthRT.name = "DLSS_Depth";
+        depthRT.filterMode = FilterMode.Point;
+        depthRT.enableRandomWrite = true;
+        depthRT.Create();
+
+        dlssOutputRT = new RenderTexture(w, h, 0, RenderTextureFormat.ARGBFloat);
+        dlssOutputRT.name = "DLSS_Output";
+        dlssOutputRT.filterMode = FilterMode.Point;
+        dlssOutputRT.enableRandomWrite = true;
+        dlssOutputRT.Create();
+
+        dlssNeedsReset = true;
+    }
+
+    void ReleaseDLSS()
+    {
+        if (dlssInitAttempted)
+        {
+            try
+            {
+                var cb = new CommandBuffer { name = "DLSS Shutdown" };
+                DLSSInterop.IssuePluginEvent(cb, DLSSInterop.EventShutdown, IntPtr.Zero);
+                Graphics.ExecuteCommandBuffer(cb);
+                cb.Dispose();
+            }
+            catch (Exception) { /* 卸载阶段尽力而为 */ }
+        }
+        FreeHGlobalRef(ref dlssInitDataPtr);
+        FreeHGlobalRef(ref dlssSearchPathPtr);
+        FreeHGlobalRef(ref dlssAppDataPtr);
+        FreeHGlobalRef(ref dlssCreateDataPtr);
+        for (int i = 0; i < dlssEvalBufs.Length; i++) FreeHGlobalRef(ref dlssEvalBufs[i]);
+
+        ReleaseRT(ref motionVectorRT);
+        ReleaseRT(ref depthRT);
+        ReleaseRT(ref dlssOutputRT);
+
+        dlssState = DLSSInterop.StateNotInitialized;
+        dlssCreatePending = false;
+        dlssNeedsReset = false;
+    }
+
+    static void FreeHGlobalRef(ref IntPtr p)
+    {
+        if (p != IntPtr.Zero) { Marshal.FreeHGlobal(p); p = IntPtr.Zero; }
     }
 }

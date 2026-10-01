@@ -1,5 +1,9 @@
 ﻿#pragma kernel CSMain
 
+// DLSS 变体:C# 侧按 enableDLSS && 插件就绪 EnableKeyword/DisableKeyword("DLSS_ON")
+// DLSS_OFF 变体不含 MV/深度 UAV,无绑定要求(回退路径零浪费,消除 not set 警告)
+#pragma multi_compile_local _ DLSS_ON
+
 // ============================================================
 //  SVO Path Tracing — 体素场景路径追踪计算着色器
 //
@@ -35,6 +39,14 @@ int    _SVODepth;     // 八叉树深度
 // ---- 相机参数 ----
 float4x4 _InverseVP;  // 逆 ViewProjection（裁剪空间 → 世界空间）
 float3   _CameraPos;  // 相机世界坐标
+
+// ---- DLSS 支持（DLSS_ON 变体；颜色/MV/深度共用 C# 侧 jittered 投影矩阵）----
+float4x4 _CurVP;           // 当前帧 ViewProjection（含 jitter，GL GPU 约定）
+float4x4 _PrevVP;          // 上一帧 ViewProjection（含 jitter）
+#ifdef DLSS_ON
+RWTexture2D<float2> _MotionVectorRT; // 像素空间 MV，指向上一帧位置（DLSS 约定）
+RWTexture2D<float>  _DepthRT;        // hardware depth [0,1]（near=0, far=1，非反转）
+#endif
 
 // ---- 天空盒 Cubemap ----
 TextureCube _SkyboxTex;
@@ -944,9 +956,11 @@ void SampleBSDF(VoxelMaterial mat, float3 hitNGrid, float3 rdGrid,
 //         c. BSDF sample → 新方向 + throughput 更新 + PDF 记录
 //         d. 俄罗斯轮盘赌 → 概率终止
 // ============================================================
-float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed, out bool hitSky)
+float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed, out bool hitSky,
+                 out float3 firstHitWorld)
 {
     hitSky = false;
+    firstHitWorld = float3(0, 0, 0);   // 首射线未命中几何体时保持零（sky 标记）
     float3 radiance   = float3(0, 0, 0);
     float3 throughput = float3(1, 1, 1);
     bool   isInside   = false;
@@ -986,6 +1000,10 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed, out bool hitSk
             radiance += throughput * misWeight * skyCol;
             return radiance;
         }
+
+        // ---- 首射线命中点 → 世界坐标（DLSS MV/深度用；网格=世界仅平移缩放）----
+        if (firstRay)
+            firstHitWorld = hitPos * _SVOScale + _SVORootMin;
 
         // ---- 读取完整材质 ----
         VoxelMaterial mat = ReadMaterial(matIndex);
@@ -1072,7 +1090,7 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed, out bool hitSk
 //  像素采样（含子像素抖动）
 // ============================================================
 float3 SamplePixel(float2 samplePos, float2 jitter, float2 imageSize,
-                   float4x4 invVP, inout uint seed)
+                   float4x4 invVP, inout uint seed, out bool hitSky, out float3 firstHitWorld)
 {
     float2 clipCoords = (samplePos + jitter) / imageSize * 2.0 - 1.0;
     float4 farWorld = mul(invVP, float4(clipCoords, 1.0, 1.0));
@@ -1081,8 +1099,8 @@ float3 SamplePixel(float2 samplePos, float2 jitter, float2 imageSize,
     float3 rd = normalize(farWorld.xyz - _CameraPos);
     float3 ro = _CameraPos;
 
-    bool hitSky;
-    float3 result = PathTrace(ro, rd, seed, hitSky);
+    // hitSky/firstHitWorld 由 out 参数直接返回
+    float3 result = PathTrace(ro, rd, seed, hitSky, firstHitWorld);
 
     // 萤火虫抑制：仅对命中几何体的路径钳制，纯天空射线不钳制
     if (!hitSky)
@@ -1114,17 +1132,55 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     // 随机种子（基于像素位置 + 帧号）
     uint seed = (uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + (uint)_FrameCount * 26699u) | 1u;
 
-    // 子像素抗锯齿抖动
+    // 子像素抗锯齿抖动（DLSS 变体：采样像素中心，抖动完全由 C# 侧
+    // jittered 投影矩阵承担 → 实际采样位置 = 像素中心 + (jx, -jy)）
     float2 jitter;
+    #ifdef DLSS_ON
+    jitter = float2(0.5f, 0.5f);
+    #else
     if (_FrameCount == 0)
         jitter = float2(0.5f, 0.5f); // 首帧：像素中心
     else
         jitter = float2(rand(seed), rand(seed)); // 后续帧：随机抖动
+    #endif
 
     // 构建相机射线 + 路径追踪
-    float3 color = SamplePixel(samplePos, jitter, imageSize, _InverseVP, seed);
+    bool hitSky;
+    float3 firstHitWorld;
+    float3 color = SamplePixel(samplePos, jitter, imageSize, _InverseVP, seed, hitSky, firstHitWorld);
 
-    // 时域累积
+    #ifdef DLSS_ON
+    // ---- DLSS 附加输出：运动向量 + hardware depth ----
+    {
+        if (hitSky)
+        {
+            // 天空像素：MV=0，深度=远平面
+            _MotionVectorRT[pixel] = float2(0.0f, 0.0f);
+            _DepthRT[pixel] = 1.0f;
+            _PathTracingResult[pixel] = float4(color, 1.0);
+            return;
+        }
+
+        float4 curClip  = mul(_CurVP,  float4(firstHitWorld, 1.0));
+        float4 prevClip = mul(_PrevVP, float4(firstHitWorld, 1.0));
+
+        // NDC → UV（与 SamplePixel 的 clipCoords 映射约定一致）
+        float2 curUV  = curClip.xy  / max(curClip.w,  1e-6f) * 0.5 + 0.5;
+        float2 prevUV = prevClip.xy / max(prevClip.w, 1e-6f) * 0.5 + 0.5;
+
+        // DLSS 约定：MV 指向上一帧位置（像素单位）
+        _MotionVectorRT[pixel] = (prevUV - curUV) * imageSize;
+
+        // hardware depth：近=0 远=1（Unity D3D12 非反转深度）
+        _DepthRT[pixel] = saturate(curClip.z / max(curClip.w, 1e-6f));
+
+        // DLSS 路径不做时域累积：单帧 1spp 直接输出（降噪交给 DLSS）
+        _PathTracingResult[pixel] = float4(color, 1.0);
+        return;
+    }
+    #endif
+
+    // ---- 时域累积（回退路径：DLSS 不可用时）----
     if (_FrameCount == 0)
     {
         _PathTracingResult[pixel] = float4(color, 1.0);

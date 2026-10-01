@@ -392,6 +392,7 @@ MonoBehaviour:
   svoLighting: {fileID: 7200000, guid: b83a0f5624ebe83489b10b56e20acf95, type: 3}
   svoPathTracing: {fileID: 7200000, guid: 408e275a38cb6894c88c9ebaf9b44fe1, type: 3}
   maxBounceDepth: 3
+  enableDLSS: 1
 --- !u!1 &1171443738
 GameObject:
   m_ObjectHideFlags: 0
@@ -435,6 +436,54 @@ Transform:
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
   m_LocalPosition: {x: 0, y: 10, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!1 &1190741484
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1190741486}
+  - component: {fileID: 1190741485}
+  m_Layer: 0
+  m_Name: CastleAll
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 0
+--- !u!114 &1190741485
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1190741484}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 039da382c5b1af1478f29389f7918d5b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  voxFilePath: Assets/Scenes/Vox/castle-all.vox
+  voxelScale: 1
+  loadOnStart: 1
+  handle: -1
+--- !u!4 &1190741486
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1190741484}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 2.6052024, y: 9.971338, z: 2.273353}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -498,3 +547,4 @@ SceneRoots:
   - {fileID: 1576022978}
   - {fileID: 629151430}
   - {fileID: 1171443740}
+  - {fileID: 1190741486}
