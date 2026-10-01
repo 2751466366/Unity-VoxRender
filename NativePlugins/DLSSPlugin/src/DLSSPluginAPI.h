@@ -71,6 +71,8 @@ struct DLSSCreateData
     unsigned int outputHeight;
     int perfQuality;                // DLSSPerfQuality
     int featureFlags;               // DLSS_FLAG_* 组合
+    int mode;                       // 0 = DLSS-SR, 1 = RR(DLSS-D)
+    int roughnessMode;              // RR: 0 = Unpacked, 1 = Packed(normals.w)
 };
 
 // DLSS_EVENT_EVALUATE
@@ -87,6 +89,14 @@ struct DLSSEvalData
     unsigned int subrectWidth;      // 实际渲染尺寸(= inputWidth/Height,除非局部渲染)
     unsigned int subrectHeight;
     int reset;                      // 非 0 = 丢弃历史(分辨率变化、场景切换)
+    // ---- RR 专用（SR 模式忽略;追加在尾部保持旧偏移不变）----
+    void* diffuseAlbedo;            // ID3D12Resource*: rgb = diffuse albedo
+    void* specularAlbedo;           // ID3D12Resource*: rgb = specular F0
+    void* normals;                  // ID3D12Resource*: xyz=世界法线, w=roughness(Packed)
+    float* worldToViewMatrix;       // 指向 16 float(渲染线程异步消费 → 指针必须指向持久内存)
+    float* viewToClipMatrix;        // 指向 16 float
+    float preExposure;              // 0 → helper 默认 1.0(无预曝光)
+    float frameTimeDeltaInMsec;     // 帧间隔 ms(降噪强度参考)
 };
 
 // ============================================================================
@@ -119,6 +129,10 @@ DLSS_API int DLSS_GetOptimalSettings(int outputWidth, int outputHeight, int perf
 
 // 最近一次诊断信息(线程安全读取)
 DLSS_API const char* DLSS_GetLastMessage(void);
+
+// RR(DLSS-D)可用性查询(需 Init 成功后有效)
+// 返回 1=可用 / 0=不可用(驱动过旧或非 RTX) / -1=未初始化
+DLSS_API int DLSS_RRAvailable(void);
 
 #ifdef __cplusplus
 }

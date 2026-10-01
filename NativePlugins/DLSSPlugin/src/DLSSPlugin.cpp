@@ -1,5 +1,5 @@
 // ============================================================================
-//  DLSSPlugin.cpp — Unity 原生插件:NVIDIA NGX DLSS-SR 集成(D3D12 后端)
+//  DLSSPlugin.cpp — Unity 原生插件:NVIDIA NGX DLSS-SR / DLSS-RR(Ray Reconstruction)集成(D3D12 后端)
 //
 //  职责:
 //    1. UnityPluginLoad 获取 IUnityGraphicsD3D12v8(ID3D12Device/队列/ExecuteCommandList)
@@ -27,6 +27,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 
 #include "../UnityHeaders/IUnityInterface.h"
 #include "../UnityHeaders/IUnityGraphics.h"
@@ -36,6 +37,9 @@
 #include "nvsdk_ngx_defs.h"
 #include "nvsdk_ngx_params.h"
 #include "nvsdk_ngx_helpers.h"
+#include "nvsdk_ngx_defs_dlssd.h"    // RR(DLSS-D):参数名/枚举
+#include "nvsdk_ngx_params_dlssd.h"  // RR:NVSDK_NGX_DLSSD_Create_Params
+#include "nvsdk_ngx_helpers_dlssd.h" // RR:NGX_D3D12_CREATE/EVALUATE_DLSSD_EXT
 
 #include "DLSSPluginAPI.h"
 
@@ -59,6 +63,38 @@ static NVSDK_NGX_Parameter*     s_CapabilityParams = nullptr;  // OptimalSetting
 static wchar_t  s_DllSearchPath[MAX_PATH + 1] = {};
 static wchar_t  s_AppDataPath[MAX_PATH + 1]   = {};
 static unsigned long long s_AppId = 0;
+
+// 活动模式(CreateFeature 时确定):0 = DLSS-SR, 1 = RR(DLSS-D)
+static int s_ActiveMode = 0;
+
+// NGX 日志回调:SDK fallback 模式下不挂回调则只走 OutputDebugString,不落盘。
+// 调试期把 NGX 日志抓到 %TEMP%\NvNGX_VoxRender.log,便于排查 CreateFeature 错误码。
+static std::mutex s_NgxLogMutex;
+static FILE*      s_NgxLogFile = nullptr;
+static void NgxLogCallback(const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature)
+{
+    if (!message) return;
+    OutputDebugStringA("[NGX] ");
+    OutputDebugStringA(message);
+    std::lock_guard<std::mutex> lk(s_NgxLogMutex);
+    if (!s_NgxLogFile)
+    {
+        char path[MAX_PATH];
+        if (GetTempPathA(MAX_PATH, path) && strcat_s(path, "NvNGX_VoxRender.log") == 0)
+            fopen_s(&s_NgxLogFile, path, "a");
+    }
+    if (s_NgxLogFile)
+    {
+        fputs(message, s_NgxLogFile);
+        if (!strchr(message, '\n')) fputc('\n', s_NgxLogFile);
+        fflush(s_NgxLogFile);
+    }
+}
+
+// RR 矩阵静态存储:NGX 在渲染线程异步消费 float*,不能指向调用方短命内存
+// (C# 源块只需活到本事件返回,插件拷贝后自行持有生命周期)
+static float s_WorldToView[16] = {};
+static float s_ViewToClip[16]  = {};
 
 // 诊断信息(SRWLOCK 保护)
 static SRWLOCK      s_MsgLock   = SRWLOCK_INIT;
@@ -223,7 +259,8 @@ static void HandleInit(DLSSInitData* data)
         info.PathListInfo.Path   = pathPtrs;
         info.PathListInfo.Length = 1;
     }
-    info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_OFF;
+    info.LoggingInfo.LoggingCallback    = NgxLogCallback;
+    info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE; // 调试期：经回调写入 %TEMP%\NvNGX_VoxRender.log；定稿改回 OFF
 
     const wchar_t* appDataPath = (s_AppDataPath[0] != L'\0') ? s_AppDataPath : L".";
     NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(s_AppId, appDataPath, s_Device, &info, NVSDK_NGX_Version_API);
@@ -272,24 +309,56 @@ static void HandleCreateFeature(DLSSCreateData* data)
         return;
     }
 
-    NVSDK_NGX_DLSS_Create_Params createParams = {};
-    createParams.Feature.InWidth           = data->inputWidth;
-    createParams.Feature.InHeight          = data->inputHeight;
-    createParams.Feature.InTargetWidth     = data->outputWidth;
-    createParams.Feature.InTargetHeight    = data->outputHeight;
-    createParams.Feature.InPerfQualityValue = static_cast<NVSDK_NGX_PerfQuality_Value>(data->perfQuality);
-    createParams.InFeatureCreateFlags      = data->featureFlags;
-    createParams.InEnableOutputSubrects    = false;
+    s_ActiveMode = (data->mode == 1) ? 1 : 0;
+    s_Params->Reset(); // 清除上次 evaluate/create 残留的键
 
     // 创建命令经 Unity 命令流执行(与后续 evaluate 同队列,顺序保证)
     int slot = -1;
     ID3D12GraphicsCommandList* cmd = BeginCmdList(slot);
     if (!cmd) { s_State = DLSS_STATE_FEATURE_FAILED; return; }
 
-    NVSDK_NGX_Result r = NGX_D3D12_CREATE_DLSS_EXT(cmd, 0, 0, &s_Feature, s_Params, &createParams);
+    NVSDK_NGX_Result r;
+    if (s_ActiveMode == 1)
+    {
+        // ---- RR (DLSS-D) ----
+        NVSDK_NGX_DLSSD_Create_Params createParams = {};
+        createParams.InWidth                = data->inputWidth;
+        createParams.InHeight               = data->inputHeight;
+        createParams.InTargetWidth          = data->outputWidth;
+        createParams.InTargetHeight         = data->outputHeight;
+        createParams.InPerfQualityValue     = static_cast<NVSDK_NGX_PerfQuality_Value>(data->perfQuality);
+        // RR 强制要求声明 MV 为渲染分辨率（MVLowRes）；我们的 MV 本就在输入分辨率，仅需声明
+        createParams.InFeatureCreateFlags   = data->featureFlags | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
+        createParams.InEnableOutputSubrects = false;
+        createParams.InRoughnessMode        = data->roughnessMode
+            ? NVSDK_NGX_DLSS_Roughness_Mode_Packed    // roughness 存 normals.w
+            : NVSDK_NGX_DLSS_Roughness_Mode_Unpacked;
+        createParams.InUseHWDepth           = NVSDK_NGX_DLSS_Depth_Type_HW; // 输出即 HW depth(非反转)
+        // DLAA 档固定 preset D（transformer 模型）；注意 1/2/3 是已移除的 preset A/B/C，勿用。
+        // 用 unsigned 重载（与 helper 内部 SetUI 一致，避免参数表类型不匹配）
+        s_Params->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA,
+                      static_cast<unsigned int>(NVSDK_NGX_RayReconstruction_Hint_Render_Preset_D));
+
+        r = NGX_D3D12_CREATE_DLSSD_EXT(cmd, 0, 0, &s_Feature, s_Params, &createParams);
+    }
+    else
+    {
+        // ---- DLSS-SR ----
+        NVSDK_NGX_DLSS_Create_Params createParams = {};
+        createParams.Feature.InWidth           = data->inputWidth;
+        createParams.Feature.InHeight          = data->inputHeight;
+        createParams.Feature.InTargetWidth     = data->outputWidth;
+        createParams.Feature.InTargetHeight    = data->outputHeight;
+        createParams.Feature.InPerfQualityValue = static_cast<NVSDK_NGX_PerfQuality_Value>(data->perfQuality);
+        createParams.InFeatureCreateFlags      = data->featureFlags;
+        createParams.InEnableOutputSubrects    = false;
+
+        r = NGX_D3D12_CREATE_DLSS_EXT(cmd, 0, 0, &s_Feature, s_Params, &createParams);
+    }
+
     if (NVSDK_NGX_FAILED(r))
     {
-        SetMessage("CreateFeature(DLSS-SR) failed: 0x%08x", r);
+        SetMessage("CreateFeature(%s) failed: 0x%08x", s_ActiveMode == 1 ? "RR" : "DLSS-SR", r);
         EndAndExecute(slot, cmd, nullptr, 0); // 即使失败也把已录制命令收尾
         s_Feature = nullptr;
         s_State   = DLSS_STATE_FEATURE_FAILED;
@@ -298,7 +367,8 @@ static void HandleCreateFeature(DLSSCreateData* data)
     if (!EndAndExecute(slot, cmd, nullptr, 0)) { s_State = DLSS_STATE_FEATURE_FAILED; return; }
 
     s_State = DLSS_STATE_FEATURE_READY;
-    SetMessage("DLSS-SR feature ready (in %ux%u -> out %ux%u)",
+    SetMessage("%s feature ready (in %ux%u -> out %ux%u)",
+               s_ActiveMode == 1 ? "DLSS-RR" : "DLSS-SR",
                data->inputWidth, data->inputHeight, data->outputWidth, data->outputHeight);
 }
 
@@ -310,40 +380,89 @@ static void HandleEvaluate(DLSSEvalData* data)
         SetMessage("Evaluate: null input/output");
         return;
     }
+    if (s_ActiveMode == 1 &&
+        (!data->diffuseAlbedo || !data->specularAlbedo || !data->normals ||
+         !data->worldToViewMatrix || !data->viewToClipMatrix))
+    {
+        SetMessage("Evaluate(RR): missing GBuffer inputs");
+        return;
+    }
 
     // 重置参数表(清除上次 evaluate/CreateFeature 残留的键)
     s_Params->Reset();
-
-    NVSDK_NGX_D3D12_DLSS_Eval_Params eval = {};
-    eval.Feature.pInColor   = static_cast<ID3D12Resource*>(data->color);
-    eval.Feature.pInOutput  = static_cast<ID3D12Resource*>(data->output);
-    eval.Feature.InSharpness = 0.0f; // DLSS 3.7+ 已弃用锐化,保持 0
-    eval.pInDepth           = static_cast<ID3D12Resource*>(data->depth);
-    eval.pInMotionVectors   = static_cast<ID3D12Resource*>(data->motionVectors);
-    eval.InJitterOffsetX    = data->jitterX;
-    eval.InJitterOffsetY    = data->jitterY;
-    eval.InRenderSubrectDimensions.Width  = data->subrectWidth;
-    eval.InRenderSubrectDimensions.Height = data->subrectHeight;
-    eval.InReset             = data->reset ? 1 : 0;
-    eval.InMVScaleX          = data->mvScaleX; // helper 内 0 → 默认 1.0
-    eval.InMVScaleY          = data->mvScaleY;
 
     int slot = -1;
     ID3D12GraphicsCommandList* cmd = BeginCmdList(slot);
     if (!cmd) return; // 本帧跳过,不影响状态
 
-    NVSDK_NGX_Result r = NGX_D3D12_EVALUATE_DLSS_EXT(cmd, s_Feature, s_Params, &eval);
+    NVSDK_NGX_Result r;
+    UnityGraphicsD3D12ResourceState states[7];
+    int stateCount = 4;
 
-    // NGX DX12 资源状态契约:输入/输出资源以 UAV 状态进出,
-    // NGX 内部自行管理采样/写入所需的内部屏障。
-    UnityGraphicsD3D12ResourceState states[4] = {
-        { static_cast<ID3D12Resource*>(data->color),         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS },
-        { static_cast<ID3D12Resource*>(data->depth),         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS },
-        { static_cast<ID3D12Resource*>(data->motionVectors), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS },
-        { static_cast<ID3D12Resource*>(data->output),        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS },
-    };
+    if (s_ActiveMode == 1)
+    {
+        // ---- RR:矩阵拷贝到插件持久内存(C# 源块只需活到本事件返回)----
+        memcpy(s_WorldToView, data->worldToViewMatrix, sizeof(float) * 16);
+        memcpy(s_ViewToClip,  data->viewToClipMatrix,  sizeof(float) * 16);
 
-    const bool submitted = EndAndExecute(slot, cmd, states, 4);
+        NVSDK_NGX_D3D12_DLSSD_Eval_Params eval = {};
+        eval.pInColor           = static_cast<ID3D12Resource*>(data->color);
+        eval.pInOutput          = static_cast<ID3D12Resource*>(data->output);
+        eval.pInDepth           = static_cast<ID3D12Resource*>(data->depth);
+        eval.pInMotionVectors   = static_cast<ID3D12Resource*>(data->motionVectors);
+        eval.InJitterOffsetX    = data->jitterX;
+        eval.InJitterOffsetY    = data->jitterY;
+        eval.InRenderSubrectDimensions.Width  = data->subrectWidth;
+        eval.InRenderSubrectDimensions.Height = data->subrectHeight;
+        eval.InReset             = data->reset ? 1 : 0;
+        eval.InMVScaleX          = data->mvScaleX; // helper 内 0 → 默认 1.0
+        eval.InMVScaleY          = data->mvScaleY;
+        eval.pInDiffuseAlbedo    = static_cast<ID3D12Resource*>(data->diffuseAlbedo);
+        eval.pInSpecularAlbedo   = static_cast<ID3D12Resource*>(data->specularAlbedo);
+        eval.pInNormals          = static_cast<ID3D12Resource*>(data->normals);
+        eval.pInWorldToViewMatrix = s_WorldToView;
+        eval.pInViewToClipMatrix  = s_ViewToClip;
+        eval.InPreExposure          = data->preExposure;          // 0 → helper 默认 1.0
+        eval.InFrameTimeDeltaInMsec = data->frameTimeDeltaInMsec;
+
+        r = NGX_D3D12_EVALUATE_DLSSD_EXT(cmd, s_Feature, s_Params, &eval);
+
+        // NGX DX12 资源状态契约:输入/输出资源以 UAV 状态进出
+        states[0] = { static_cast<ID3D12Resource*>(data->color),          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
+        states[1] = { static_cast<ID3D12Resource*>(data->depth),          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
+        states[2] = { static_cast<ID3D12Resource*>(data->motionVectors),  D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
+        states[3] = { static_cast<ID3D12Resource*>(data->output),         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
+        states[4] = { static_cast<ID3D12Resource*>(data->diffuseAlbedo),  D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
+        states[5] = { static_cast<ID3D12Resource*>(data->specularAlbedo), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
+        states[6] = { static_cast<ID3D12Resource*>(data->normals),        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
+        stateCount = 7;
+    }
+    else
+    {
+        // ---- DLSS-SR ----
+        NVSDK_NGX_D3D12_DLSS_Eval_Params eval = {};
+        eval.Feature.pInColor   = static_cast<ID3D12Resource*>(data->color);
+        eval.Feature.pInOutput  = static_cast<ID3D12Resource*>(data->output);
+        eval.Feature.InSharpness = 0.0f; // DLSS 3.7+ 已弃用锐化,保持 0
+        eval.pInDepth           = static_cast<ID3D12Resource*>(data->depth);
+        eval.pInMotionVectors   = static_cast<ID3D12Resource*>(data->motionVectors);
+        eval.InJitterOffsetX    = data->jitterX;
+        eval.InJitterOffsetY    = data->jitterY;
+        eval.InRenderSubrectDimensions.Width  = data->subrectWidth;
+        eval.InRenderSubrectDimensions.Height = data->subrectHeight;
+        eval.InReset             = data->reset ? 1 : 0;
+        eval.InMVScaleX          = data->mvScaleX; // helper 内 0 → 默认 1.0
+        eval.InMVScaleY          = data->mvScaleY;
+
+        r = NGX_D3D12_EVALUATE_DLSS_EXT(cmd, s_Feature, s_Params, &eval);
+
+        states[0] = { static_cast<ID3D12Resource*>(data->color),         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
+        states[1] = { static_cast<ID3D12Resource*>(data->depth),         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
+        states[2] = { static_cast<ID3D12Resource*>(data->motionVectors), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
+        states[3] = { static_cast<ID3D12Resource*>(data->output),        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
+    }
+
+    const bool submitted = EndAndExecute(slot, cmd, states, stateCount);
 
     // 连续失败降级:C# 侧 DLSS_GetState 会看到 FEATURE_FAILED 并回退时域累积
     if (NVSDK_NGX_FAILED(r) || !submitted)
@@ -371,7 +490,8 @@ static void HandleReleaseFeature()
         SetMessage("DLSS feature released");
     }
     s_ConsecutiveFails = 0;
-    if (s_State == DLSS_STATE_FEATURE_READY)
+    // FEATURE_FAILED 也回退到 INIT_SUCCEEDED:C# 侧 RR→SR 降级重试依赖此语义
+    if (s_State == DLSS_STATE_FEATURE_READY || s_State == DLSS_STATE_FEATURE_FAILED)
         s_State = DLSS_STATE_INIT_SUCCEEDED;
 }
 
@@ -515,4 +635,17 @@ DLSS_API const char* DLSS_GetLastMessage(void)
     const char* msg = s_Msg;
     ReleaseSRWLockShared(&s_MsgLock);
     return msg;
+}
+
+DLSS_API int DLSS_RRAvailable(void)
+{
+    if (s_State != DLSS_STATE_INIT_SUCCEEDED && s_State != DLSS_STATE_FEATURE_READY)
+        return -1;
+    if (!s_CapabilityParams) { SetMessage("RRAvailable: no capability params"); return 0; }
+    int v = 0;
+    NVSDK_NGX_Result r = NVSDK_NGX_Parameter_GetI(s_CapabilityParams,
+            NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &v);
+    if (NVSDK_NGX_FAILED(r)) { SetMessage("RRAvailable: GetI failed 0x%08x", r); return 0; }
+    SetMessage("RRAvailable: %d (requires nvngx_dlssd.dll in search path)", v);
+    return v ? 1 : 0;
 }

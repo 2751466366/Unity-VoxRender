@@ -42,6 +42,10 @@ public class CameraRender : MonoBehaviour
     [Header("DLSS")]
     [Tooltip("启用 DLSS 降噪（DLAA 模式，100% 渲染分辨率）；插件不可用时自动回退时域累积")]
     public bool enableDLSS = true;
+        [Tooltip("Auto = 优先 RR（不可用自动降级 SR）；RayReconstruction；SuperResolution")]
+        public DLSSMode dlssMode = DLSSMode.Auto;
+    
+        public enum DLSSMode { Auto, RayReconstruction, SuperResolution }
 
     public enum DebugView
     {
@@ -77,6 +81,12 @@ public class CameraRender : MonoBehaviour
     private IntPtr dlssCreateDataPtr = IntPtr.Zero;
     private readonly IntPtr[] dlssEvalBufs = new IntPtr[2]; // 双缓冲交替
     private int dlssEvalBufIdx = 0;
+    private int  dlssActiveMode = DLSSInterop.ModeSR; // 实际模式（CREATE 前由 ResolveDLSSMode 解析）
+    private readonly IntPtr[] dlssMatrixBufs = new IntPtr[2]; // RR 矩阵双缓冲（每块 32 float：W2V+V2C）
+    private int dlssMatrixBufIdx = 0;
+    private RenderTexture diffuseAlbedoRT;    // RR GBuffer: ARGBHalf
+    private RenderTexture specularAlbedoRT;
+    private RenderTexture normalRoughnessRT;  // xyz=世界法线, w=roughness
 
     // SVO G-Buffer RenderTextures（由 SVO_GBuffer.compute 写入）
     private RenderTexture gBufferAlbedo;    // RT0: ARGB32
@@ -88,6 +98,7 @@ public class CameraRender : MonoBehaviour
 
     // DLSS keyword 变体（SVO_PathTracing.compute 的 multi_compile_local）
     private const string DlssOnKeyword = "DLSS_ON";
+    private const string DlssRrKeyword = "DLSS_RR";
 
     // Shader property IDs
     private static readonly int AlbedoTexID   = Shader.PropertyToID("_AlbedoTex");
@@ -406,8 +417,11 @@ public class CameraRender : MonoBehaviour
 
         // ---- DLSS 状态机推进（INIT → CREATE → READY，失败自动回退时域累积）----
         AdvanceDLSSState(w, h, resolutionChanged);
-        bool useDLSS = enableDLSS && dlssState == DLSSInterop.StateFeatureReady
-                       && pathTracingRT.GetNativeTexturePtr() != IntPtr.Zero;
+        bool dlssReady = enableDLSS && dlssState == DLSSInterop.StateFeatureReady
+                         && pathTracingRT.GetNativeTexturePtr() != IntPtr.Zero;
+        bool useRR = dlssReady && dlssActiveMode == DLSSInterop.ModeRR;
+        bool useSR = dlssReady && dlssActiveMode == DLSSInterop.ModeSR;
+        bool useDLSS = useRR || useSR;
         if (useDLSS) EnsureDLSSRTs(w, h);
 
         // 检测方向光
@@ -458,19 +472,28 @@ public class CameraRender : MonoBehaviour
 
         try
         {
-            Matrix4x4 vp = GL.GetGPUProjectionMatrix(projMatrix, false) * cam.worldToCameraMatrix;
+            Matrix4x4 viewToClip = GL.GetGPUProjectionMatrix(projMatrix, false);
+            Matrix4x4 vp = viewToClip * cam.worldToCameraMatrix;
             svoPathTracing.SetMatrix("_InverseVP", vp.inverse);
             svoPathTracing.SetMatrix("_CurVP", vp);
             svoPathTracing.SetMatrix("_PrevVP", prevJitteredVP);
             svoPathTracing.SetVector("_CameraPos", cam.transform.position);
-            // DLSS 变体切换：未启用时变体不含 MV/深度 UAV，无绑定要求（消除 not set 警告）
-            if (useDLSS) svoPathTracing.EnableKeyword(DlssOnKeyword);
-            else         svoPathTracing.DisableKeyword(DlssOnKeyword);
+            // DLSS 变体切换：未启用时变体不含 DLSS UAV，无绑定要求（消除 not set 警告）
+            if (useRR) svoPathTracing.EnableKeyword(DlssRrKeyword);
+            else       svoPathTracing.DisableKeyword(DlssRrKeyword);
+            if (useSR) svoPathTracing.EnableKeyword(DlssOnKeyword);
+            else       svoPathTracing.DisableKeyword(DlssOnKeyword);
             svoPathTracing.SetTexture(kernel, "_PathTracingResult", pathTracingRT);
             if (useDLSS)
             {
                 svoPathTracing.SetTexture(kernel, "_MotionVectorRT", motionVectorRT);
                 svoPathTracing.SetTexture(kernel, "_DepthRT", depthRT);
+            }
+            if (useRR)
+            {
+                svoPathTracing.SetTexture(kernel, "_DiffuseAlbedoRT", diffuseAlbedoRT);
+                svoPathTracing.SetTexture(kernel, "_SpecularAlbedoRT", specularAlbedoRT);
+                svoPathTracing.SetTexture(kernel, "_NormalRoughnessRT", normalRoughnessRT);
             }
 
             // 天空盒
@@ -508,7 +531,7 @@ public class CameraRender : MonoBehaviour
             pathTracingFrameCount++;
 
             // ---- DLSS evaluate（渲染线程执行，严格位于 dispatch 之后）----
-            if (useDLSS) IssueDLSSEvaluate(w, h, jx, jy);
+            if (useDLSS) IssueDLSSEvaluate(w, h, jx, jy, viewToClip);
 
             prevJitteredVP = vp;
         }
@@ -567,9 +590,10 @@ public class CameraRender : MonoBehaviour
             return;
         }
 
-        // 3. INIT 成功 → 创建 feature（一次；DLAA：输入=输出=全分辨率）
+        // 3. INIT 成功 → 解析实际模式 + 创建 feature（一次；DLAA：输入=输出=全分辨率）
         if (dlssState == DLSSInterop.StateInitSucceeded && !dlssCreatePending)
         {
+            ResolveDLSSMode();
             dlssCreatePending = true;
             IssueDLSSCreate(w, h);
         }
@@ -622,6 +646,8 @@ public class CameraRender : MonoBehaviour
                 outputHeight = (uint)h,
                 perfQuality  = DLSSInterop.QualityDLAA,
                 featureFlags = DLSSInterop.FlagIsHDR | DLSSInterop.FlagMVJittered,
+                mode          = dlssActiveMode,
+                roughnessMode = DLSSInterop.RoughnessPacked, // roughness 存 normals.w
             };
             if (dlssCreateDataPtr == IntPtr.Zero) dlssCreateDataPtr = DLSSInterop.AllocStruct(ref create);
             else DLSSInterop.WriteStruct(dlssCreateDataPtr, ref create);
@@ -635,8 +661,24 @@ public class CameraRender : MonoBehaviour
         catch (Exception ex) { Debug.LogWarning("[DLSS] CreateFeature 异常: " + ex.Message); }
     }
 
-    void IssueDLSSEvaluate(int w, int h, float jx, float jy)
+    void IssueDLSSEvaluate(int w, int h, float jx, float jy, Matrix4x4 viewToClip)
     {
+        // RR 矩阵：双缓冲交替写入持久块（渲染线程异步消费 float*，不能指向短命内存）
+        IntPtr w2vPtr = IntPtr.Zero, v2cPtr = IntPtr.Zero;
+        if (dlssActiveMode == DLSSInterop.ModeRR)
+        {
+            int midx = 1 - dlssMatrixBufIdx;
+            if (dlssMatrixBufs[midx] == IntPtr.Zero)
+                dlssMatrixBufs[midx] = Marshal.AllocHGlobal(32 * sizeof(float));
+            float[] m = new float[32];
+            FlattenMatrix(cam.worldToCameraMatrix, m, 0);   // WorldToView
+            FlattenMatrix(viewToClip, m, 16);               // ViewToClip（含 jitter）
+            Marshal.Copy(m, 0, dlssMatrixBufs[midx], 32);
+            dlssMatrixBufIdx = midx;
+            w2vPtr = dlssMatrixBufs[midx];
+            v2cPtr = new IntPtr(w2vPtr.ToInt64() + 16 * sizeof(float));
+        }
+
         var eval = new DLSSInterop.EvalData
         {
             color         = pathTracingRT.GetNativeTexturePtr(),
@@ -650,6 +692,14 @@ public class CameraRender : MonoBehaviour
             subrectWidth  = (uint)w,
             subrectHeight = (uint)h,
             reset         = dlssNeedsReset ? 1 : 0,
+            // ---- RR 专用（SR 模式置空，插件侧忽略）----
+            diffuseAlbedo  = (dlssActiveMode == DLSSInterop.ModeRR && diffuseAlbedoRT != null)  ? diffuseAlbedoRT.GetNativeTexturePtr()  : IntPtr.Zero,
+            specularAlbedo = (dlssActiveMode == DLSSInterop.ModeRR && specularAlbedoRT != null) ? specularAlbedoRT.GetNativeTexturePtr() : IntPtr.Zero,
+            normals        = (dlssActiveMode == DLSSInterop.ModeRR && normalRoughnessRT != null) ? normalRoughnessRT.GetNativeTexturePtr() : IntPtr.Zero,
+            worldToViewMatrix = w2vPtr,
+            viewToClipMatrix  = v2cPtr,
+            preExposure          = 1.0f, // 无预曝光
+            frameTimeDeltaInMsec = Mathf.Max(Time.deltaTime * 1000f, 0.1f),
         };
         dlssNeedsReset = false;
 
@@ -670,8 +720,10 @@ public class CameraRender : MonoBehaviour
     /// <summary>确保 DLSS 附加 RT（MV/深度/输出）与屏幕分辨率一致。</summary>
     void EnsureDLSSRTs(int w, int h)
     {
+        bool rrRTsReady = dlssActiveMode != DLSSInterop.ModeRR ||
+                          (diffuseAlbedoRT != null && diffuseAlbedoRT.width == w && diffuseAlbedoRT.height == h);
         if (motionVectorRT != null && motionVectorRT.width == w && motionVectorRT.height == h &&
-            depthRT != null && dlssOutputRT != null)
+            depthRT != null && dlssOutputRT != null && rrRTsReady)
             return;
 
         ReleaseRT(ref motionVectorRT);
@@ -698,6 +750,54 @@ public class CameraRender : MonoBehaviour
         dlssOutputRT.Create();
 
         dlssNeedsReset = true;
+
+        // RR GBuffer 三张（惰性创建，SR 模式不占显存）
+        if (dlssActiveMode == DLSSInterop.ModeRR &&
+            (diffuseAlbedoRT == null || diffuseAlbedoRT.width != w || diffuseAlbedoRT.height != h))
+        {
+            ReleaseRT(ref diffuseAlbedoRT);
+            ReleaseRT(ref specularAlbedoRT);
+            ReleaseRT(ref normalRoughnessRT);
+
+            diffuseAlbedoRT   = CreateDLSSRT(w, h, "DLSS_DiffuseAlbedo",  RenderTextureFormat.ARGBHalf);
+            specularAlbedoRT  = CreateDLSSRT(w, h, "DLSS_SpecularAlbedo", RenderTextureFormat.ARGBHalf);
+            normalRoughnessRT = CreateDLSSRT(w, h, "DLSS_NormalRoughness", RenderTextureFormat.ARGBHalf);
+        }
+    }
+
+    static RenderTexture CreateDLSSRT(int w, int h, string name, RenderTextureFormat fmt)
+    {
+        var rt = new RenderTexture(w, h, 0, fmt);
+        rt.name = name;
+        rt.filterMode = FilterMode.Point;
+        rt.enableRandomWrite = true;
+        rt.Create();
+        return rt;
+    }
+
+    /// <summary>把 Unity Matrix4x4 展平为 16 float（按内存序，UE FMatrix 同源行主序约定）。</summary>
+    static void FlattenMatrix(Matrix4x4 m, float[] dst, int offset)
+    {
+        dst[offset + 0]  = m.m00; dst[offset + 1]  = m.m01; dst[offset + 2]  = m.m02; dst[offset + 3]  = m.m03;
+        dst[offset + 4]  = m.m10; dst[offset + 5]  = m.m11; dst[offset + 6]  = m.m12; dst[offset + 7]  = m.m13;
+        dst[offset + 8]  = m.m20; dst[offset + 9]  = m.m21; dst[offset + 10] = m.m22; dst[offset + 11] = m.m23;
+        dst[offset + 12] = m.m30; dst[offset + 13] = m.m31; dst[offset + 14] = m.m32; dst[offset + 15] = m.m33;
+    }
+
+    /// <summary>CREATE 前解析实际模式：请求 RR 时先查 RR 可用性，不可用则用 SR（日志一次）。</summary>
+    void ResolveDLSSMode()
+    {
+        int want = (dlssMode == DLSSMode.SuperResolution) ? DLSSInterop.ModeSR : DLSSInterop.ModeRR;
+        if (want == DLSSInterop.ModeRR)
+        {
+            int av = DLSSInterop.DLSS_RRAvailable();
+            if (av != 1)
+            {
+                want = DLSSInterop.ModeSR;
+                Debug.LogWarning($"[DLSS] RR 不可用(DLSS_RRAvailable={av}，驱动过旧或非 RTX)→ 使用 SR");
+            }
+        }
+        dlssActiveMode = want;
     }
 
     void ReleaseDLSS()
@@ -718,10 +818,14 @@ public class CameraRender : MonoBehaviour
         FreeHGlobalRef(ref dlssAppDataPtr);
         FreeHGlobalRef(ref dlssCreateDataPtr);
         for (int i = 0; i < dlssEvalBufs.Length; i++) FreeHGlobalRef(ref dlssEvalBufs[i]);
+        for (int i = 0; i < dlssMatrixBufs.Length; i++) FreeHGlobalRef(ref dlssMatrixBufs[i]);
 
         ReleaseRT(ref motionVectorRT);
         ReleaseRT(ref depthRT);
         ReleaseRT(ref dlssOutputRT);
+        ReleaseRT(ref diffuseAlbedoRT);
+        ReleaseRT(ref specularAlbedoRT);
+        ReleaseRT(ref normalRoughnessRT);
 
         dlssState = DLSSInterop.StateNotInitialized;
         dlssCreatePending = false;

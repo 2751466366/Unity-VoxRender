@@ -44,6 +44,12 @@ public static class DLSSInterop
     public const int FlagMVJittered    = 1 << 2;  // 采样位置含子像素抖动
     public const int FlagDepthInverted = 1 << 3;  // 近=1 远=0(reversed-Z);Unity D3D12 默认非反转,不设
 
+    // ---- Feature 模式(CreateData.mode)----
+    public const int ModeSR = 0;              // DLSS-SR / DLAA
+    public const int ModeRR = 1;              // Ray Reconstruction(DLSS-D)
+    public const int RoughnessUnpacked = 0;   // RR: roughness 独立纹理
+    public const int RoughnessPacked   = 1;   // RR: roughness 存 normals.w(推荐)
+
     // ---- DLSS_EVENT_INIT:路径为持久 UTF-16 缓冲指针 ----
     [StructLayout(LayoutKind.Sequential)]
     public struct InitData
@@ -63,6 +69,8 @@ public static class DLSSInterop
         public uint outputHeight;
         public int  perfQuality;       // Quality*
         public int  featureFlags;      // Flag* 组合
+        public int  mode;              // ModeSR / ModeRR
+        public int  roughnessMode;     // RoughnessUnpacked / RoughnessPacked（RR 用）
     }
 
     // ---- DLSS_EVENT_EVALUATE ----
@@ -80,6 +88,14 @@ public static class DLSSInterop
         public uint  subrectWidth;     // 实际渲染尺寸
         public uint  subrectHeight;
         public int   reset;            // 非 0 = 丢弃历史(分辨率变化/场景切换)
+        // ---- RR 专用（SR 模式忽略;顺序/宽度必须与 C++ DLSSEvalData 一致）----
+        public IntPtr diffuseAlbedo;   // ID3D12Resource*: rgb = diffuse albedo
+        public IntPtr specularAlbedo;  // ID3D12Resource*: rgb = specular F0
+        public IntPtr normals;         // ID3D12Resource*: xyz=世界法线, w=roughness(Packed)
+        public IntPtr worldToViewMatrix; // 指向 16 float 持久块(渲染线程异步消费)
+        public IntPtr viewToClipMatrix;  // 指向 16 float 持久块
+        public float  preExposure;     // 0 → 插件侧默认 1.0
+        public float  frameTimeDeltaInMsec;
     }
 
     // ---- C 导出接口 ----
@@ -89,6 +105,9 @@ public static class DLSSInterop
         int outputWidth, int outputHeight, int perfQuality,
         out int outOptimalWidth, out int outOptimalHeight);
     [DllImport("DLSSPlugin")] public static extern IntPtr DLSS_GetLastMessage(); // const char*
+
+    /// <summary>RR(DLSS-D)可用性:1=可用 / 0=不可用(驱动过旧或非 RTX) / -1=未初始化。</summary>
+    [DllImport("DLSSPlugin")] public static extern int DLSS_RRAvailable();
 
     /// <summary>读取插件最近诊断信息(ANSI)。</summary>
     public static string GetLastMessageManaged()

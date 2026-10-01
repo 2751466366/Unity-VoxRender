@@ -1,8 +1,9 @@
 ﻿#pragma kernel CSMain
 
-// DLSS 变体:C# 侧按 enableDLSS && 插件就绪 EnableKeyword/DisableKeyword("DLSS_ON")
-// DLSS_OFF 变体不含 MV/深度 UAV,无绑定要求(回退路径零浪费,消除 not set 警告)
-#pragma multi_compile_local _ DLSS_ON
+// DLSS 变体:C# 侧按模式 EnableKeyword("DLSS_ON"/"DLSS_RR")/DisableKeyword
+// DLSS_ON = SR/DLAA;DLSS_RR = Ray Reconstruction;无 = 时域累积回退
+// 回退变体不含 DLSS UAV,无绑定要求(零浪费,消除 not set 警告)
+#pragma multi_compile_local _ DLSS_ON DLSS_RR
 
 // ============================================================
 //  SVO Path Tracing — 体素场景路径追踪计算着色器
@@ -40,13 +41,29 @@ int    _SVODepth;     // 八叉树深度
 float4x4 _InverseVP;  // 逆 ViewProjection（裁剪空间 → 世界空间）
 float3   _CameraPos;  // 相机世界坐标
 
-// ---- DLSS 支持（DLSS_ON 变体；颜色/MV/深度共用 C# 侧 jittered 投影矩阵）----
+// ---- DLSS 支持（DLSS_ON/DLSS_RR 变体；颜色/MV/深度共用 C# 侧 jittered 投影矩阵）----
 float4x4 _CurVP;           // 当前帧 ViewProjection（含 jitter，GL GPU 约定）
 float4x4 _PrevVP;          // 上一帧 ViewProjection（含 jitter）
-#ifdef DLSS_ON
+#if defined(DLSS_ON) || defined(DLSS_RR)
 RWTexture2D<float2> _MotionVectorRT; // 像素空间 MV，指向上一帧位置（DLSS 约定）
 RWTexture2D<float>  _DepthRT;        // hardware depth [0,1]（near=0, far=1，非反转）
 #endif
+#ifdef DLSS_RR
+// RR 专用 GBuffer 引导面（与颜色/MV/深度同投影）
+RWTexture2D<float4> _DiffuseAlbedoRT;   // rgb = diffuse albedo
+RWTexture2D<float4> _SpecularAlbedoRT;  // rgb = specular F0
+RWTexture2D<float4> _NormalRoughnessRT; // xyz = 世界空间法线, w = roughness（Packed 模式）
+#endif
+
+// 首射线 GBuffer 信息（SR 用 worldPos；RR 额外填材质引导字段）
+struct FirstHitInfo
+{
+    float3 worldPos;        // MV/深度
+    float3 normal;          // 世界空间法线（RR）
+    float3 diffuseAlbedo;   // RR
+    float3 specularAlbedo;  // RR
+    float  roughness;       // RR
+};
 
 // ---- 天空盒 Cubemap ----
 TextureCube _SkyboxTex;
@@ -743,10 +760,13 @@ bool SampleEmissiveLight(float3 hitPosGrid, float3 NGrid,
     VoxelMaterial emMat = ReadMaterial(matIdx);
     float3 emColor = pow(2.0f, emMat.flux) * emMat.color;
 
-    // 5. radiance / discretePDF = color * totalPower（alias table 功率加权）
-    //    d_grid² = d_world² / scale²，最终贡献中 scale² 正确抵消
+    // 5. 无偏 NEE 估计：贡献 / 选中概率
+    //    alias table 功率加权：选中概率 p_i = Φ_i/Φ_total（SVOBuilder 同一 lum 公式）
+    //    估计量 = (I_i/d²)/p_i；旧实现漏除 Φ_i → 强光源亮度被功率平方级放大（确定性偏差）
     float distGrid2 = distWorld * distWorld / (_SVOScale * _SVOScale);
-    directLight.radianceOverPdf = emColor * _EmissiveTotalPower / distGrid2;
+    float lightLum  = dot(emColor, float3(0.2126, 0.7152, 0.0722)); // = Φ_i
+    float pSelect   = lightLum / _EmissiveTotalPower;               // = p_i
+    directLight.radianceOverPdf = emColor / max(pSelect * distGrid2, 1e-12f);
     directLight.direction = lightDir;
     directLight.distance = distWorld;
     directLight.pdf = 1.0f;  // delta 光源，MIS weight = 1.0
@@ -956,11 +976,16 @@ void SampleBSDF(VoxelMaterial mat, float3 hitNGrid, float3 rdGrid,
 //         c. BSDF sample → 新方向 + throughput 更新 + PDF 记录
 //         d. 俄罗斯轮盘赌 → 概率终止
 // ============================================================
-float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed, out bool hitSky,
-                 out float3 firstHitWorld)
+float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed,
+                 out bool hitSky, out FirstHitInfo fi)
 {
     hitSky = false;
-    firstHitWorld = float3(0, 0, 0);   // 首射线未命中几何体时保持零（sky 标记）
+    // 首射线未命中几何体：worldPos=0 为 sky 标记；RR 引导字段取中性值
+    fi.worldPos       = float3(0, 0, 0);
+    fi.normal         = float3(0, 0, 1);
+    fi.diffuseAlbedo  = float3(0, 0, 0);
+    fi.specularAlbedo = float3(0, 0, 0);
+    fi.roughness      = 1.0f;
     float3 radiance   = float3(0, 0, 0);
     float3 throughput = float3(1, 1, 1);
     bool   isInside   = false;
@@ -1003,10 +1028,42 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed, out bool hitSk
 
         // ---- 首射线命中点 → 世界坐标（DLSS MV/深度用；网格=世界仅平移缩放）----
         if (firstRay)
-            firstHitWorld = hitPos * _SVOScale + _SVORootMin;
+            fi.worldPos = hitPos * _SVOScale + _SVORootMin;
 
         // ---- 读取完整材质 ----
         VoxelMaterial mat = ReadMaterial(matIndex);
+
+        #ifdef DLSS_RR
+        // ---- 首命中 GBuffer（RR 引导输入；材质→GBuffer 映射）----
+        if (firstRay)
+        {
+            fi.normal = normalize(hitNGrid); // 网格=世界仅平移缩放，方向不变
+            if (abs(mat.type - 1.0f) < 0.5f)               // Metal
+            {
+                fi.diffuseAlbedo  = float3(0, 0, 0);
+                fi.specularAlbedo = mat.color;
+                fi.roughness      = mat.rough;
+            }
+            else if (abs(mat.type - 2.0f) < 0.5f)          // Glass
+            {
+                fi.diffuseAlbedo  = float3(0, 0, 0);
+                fi.specularAlbedo = float3(0.04, 0.04, 0.04);
+                fi.roughness      = 0.0f;
+            }
+            else if (abs(mat.type - 3.0f) < 0.5f)          // Emissive
+            {
+                fi.diffuseAlbedo  = float3(0, 0, 0);       // 自发光不反照
+                fi.specularAlbedo = float3(0, 0, 0);
+                fi.roughness      = 1.0f;
+            }
+            else                                           // Diffuse / Cloud / Blend
+            {
+                fi.diffuseAlbedo  = mat.color;
+                fi.specularAlbedo = mat.color * mat.spec;  // Schlick F0 近似
+                fi.roughness      = mat.rough;
+            }
+        }
+        #endif
 
         // ---- 自发光材质 ----
         if (abs(mat.type - 3.0f) < 0.5f) // Emissive
@@ -1090,7 +1147,7 @@ float3 PathTrace(float3 roWorld, float3 rdWorld, inout uint seed, out bool hitSk
 //  像素采样（含子像素抖动）
 // ============================================================
 float3 SamplePixel(float2 samplePos, float2 jitter, float2 imageSize,
-                   float4x4 invVP, inout uint seed, out bool hitSky, out float3 firstHitWorld)
+                   float4x4 invVP, inout uint seed, out bool hitSky, out FirstHitInfo fi)
 {
     float2 clipCoords = (samplePos + jitter) / imageSize * 2.0 - 1.0;
     float4 farWorld = mul(invVP, float4(clipCoords, 1.0, 1.0));
@@ -1099,16 +1156,22 @@ float3 SamplePixel(float2 samplePos, float2 jitter, float2 imageSize,
     float3 rd = normalize(farWorld.xyz - _CameraPos);
     float3 ro = _CameraPos;
 
-    // hitSky/firstHitWorld 由 out 参数直接返回
-    float3 result = PathTrace(ro, rd, seed, hitSky, firstHitWorld);
+    // hitSky/fi 由 out 参数直接返回
+    float3 result = PathTrace(ro, rd, seed, hitSky, fi);
 
     // 萤火虫抑制：仅对命中几何体的路径钳制，纯天空射线不钳制
+    // RR 变体放宽阈值：网络按原始重尾信号训练，过强钳制偏离训练分布
+    #ifdef DLSS_RR
+    const float ffThreshold = 40.0f;
+    #else
+    const float ffThreshold = FIREFLY_THRESHOLD;
+    #endif
     if (!hitSky)
     {
         float lum = dot(result, float3(0.2126, 0.7152, 0.0722));
-        float fireflyMask = step(FIREFLY_THRESHOLD, lum);
+        float fireflyMask = step(ffThreshold, lum);
         float clampedLum = lum * (1.0 - fireflyMask)
-                         + (FIREFLY_THRESHOLD - FIREFLY_THRESHOLD * FIREFLY_THRESHOLD / (lum + 1e-6)) * fireflyMask;
+                         + (ffThreshold - ffThreshold * ffThreshold / (lum + 1e-6)) * fireflyMask;
         result *= clampedLum / max(lum, 1e-6);
     }
 
@@ -1135,7 +1198,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     // 子像素抗锯齿抖动（DLSS 变体：采样像素中心，抖动完全由 C# 侧
     // jittered 投影矩阵承担 → 实际采样位置 = 像素中心 + (jx, -jy)）
     float2 jitter;
-    #ifdef DLSS_ON
+    #if defined(DLSS_ON) || defined(DLSS_RR)
     jitter = float2(0.5f, 0.5f);
     #else
     if (_FrameCount == 0)
@@ -1146,10 +1209,10 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
     // 构建相机射线 + 路径追踪
     bool hitSky;
-    float3 firstHitWorld;
-    float3 color = SamplePixel(samplePos, jitter, imageSize, _InverseVP, seed, hitSky, firstHitWorld);
+    FirstHitInfo fi;
+    float3 color = SamplePixel(samplePos, jitter, imageSize, _InverseVP, seed, hitSky, fi);
 
-    #ifdef DLSS_ON
+    #if defined(DLSS_ON) || defined(DLSS_RR)
     // ---- DLSS 附加输出：运动向量 + hardware depth ----
     {
         if (hitSky)
@@ -1161,8 +1224,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             return;
         }
 
-        float4 curClip  = mul(_CurVP,  float4(firstHitWorld, 1.0));
-        float4 prevClip = mul(_PrevVP, float4(firstHitWorld, 1.0));
+        float4 curClip  = mul(_CurVP,  float4(fi.worldPos, 1.0));
+        float4 prevClip = mul(_PrevVP, float4(fi.worldPos, 1.0));
 
         // NDC → UV（与 SamplePixel 的 clipCoords 映射约定一致）
         float2 curUV  = curClip.xy  / max(curClip.w,  1e-6f) * 0.5 + 0.5;
@@ -1173,6 +1236,13 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
         // hardware depth：近=0 远=1（Unity D3D12 非反转深度）
         _DepthRT[pixel] = saturate(curClip.z / max(curClip.w, 1e-6f));
+
+        #ifdef DLSS_RR
+        // ---- RR GBuffer 引导面 ----
+        _DiffuseAlbedoRT[pixel]   = float4(fi.diffuseAlbedo, 1.0);
+        _SpecularAlbedoRT[pixel]  = float4(fi.specularAlbedo, 1.0);
+        _NormalRoughnessRT[pixel] = float4(fi.normal, fi.roughness);
+        #endif
 
         // DLSS 路径不做时域累积：单帧 1spp 直接输出（降噪交给 DLSS）
         _PathTracingResult[pixel] = float4(color, 1.0);
