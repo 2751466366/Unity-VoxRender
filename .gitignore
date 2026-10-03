@@ -54,9 +54,5 @@ sysinfo.txt
 *.stackdump
 
 *.md
-
-# Packages
-# 如果有非 PackageManager 的本地 Packages 可以按需取消注释
-# Packages/
 SDK/
 NativePlugins/DLSSPlugin/build/
