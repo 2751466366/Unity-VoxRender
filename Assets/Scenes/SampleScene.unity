@@ -391,6 +391,7 @@ MonoBehaviour:
   svoGBuffer: {fileID: 7200000, guid: 4192a3641dddf42448b830b15e09e027, type: 3}
   svoLighting: {fileID: 7200000, guid: b83a0f5624ebe83489b10b56e20acf95, type: 3}
   svoPathTracing: {fileID: 7200000, guid: 408e275a38cb6894c88c9ebaf9b44fe1, type: 3}
+  enableVoxelEditing: 1
   maxBounceDepth: 3
   enableDLSS: 1
   dlssMode: 1

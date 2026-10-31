@@ -36,6 +36,10 @@ public class CameraRender : MonoBehaviour
     [Tooltip("SVO 路径追踪计算着色器（拖入 SVO_PathTracing.compute）")]
     public ComputeShader svoPathTracing;
 
+    [Header("Voxel Editing")]
+    [Tooltip("启用体素编辑：启动时自动挂载 VoxelEditor（左键点击删除体素），已存在则不重复添加")]
+    public bool enableVoxelEditing = true;
+
     [Header("Path Tracing")]
     [Range(1, 16)] public int maxBounceDepth = 4;
 
@@ -122,6 +126,13 @@ public class CameraRender : MonoBehaviour
         // 组件重新启用时允许 DLSS 重新初始化（OnDisable 已发 Shutdown）
         dlssInitAttempted = false;
         dlssFailedLogged = false;
+
+        // 体素编辑：自动挂载，免去手动 Add Component（Play 模式生效）
+        if (enableVoxelEditing && GetComponent<VoxelEditor>() == null)
+        {
+            gameObject.AddComponent<VoxelEditor>();
+            Debug.Log("[CameraRender] 已自动挂载 VoxelEditor — Play 后左键点击即可删除体素");
+        }
     }
 
     void OnDisable()
@@ -350,6 +361,16 @@ public class CameraRender : MonoBehaviour
         {
             Graphics.Blit(src, dest);
         }
+    }
+
+    /// <summary>
+    /// 重置时域累积与 DLSS 历史（体素删除等场景变化后调用，消除残影）。
+    /// 时域回退路径：帧计数归零重新累积；DLSS 路径：下一帧 evaluate 带 reset 丢历史。
+    /// </summary>
+    public void ResetAccumulation()
+    {
+        pathTracingFrameCount = 0;
+        dlssNeedsReset = true;
     }
 
     /// <summary>调度 SVO GBuffer 计算着色器（Stage 1：几何阶段）。</summary>
