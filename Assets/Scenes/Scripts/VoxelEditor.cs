@@ -11,7 +11,6 @@ using UnityEngine;
 ///
 /// 注意：仅 Play 模式生效（Update 不在编辑模式运行）。
 /// 使用方式：挂载到 Main Camera 上（CameraRender 开启 enableVoxelEditing 时自动挂载）。
-/// 每次删除后自动调用 CameraRender.ResetAccumulation() 清除路径追踪残影。
 /// </summary>
 [RequireComponent(typeof(Camera))]
 public class VoxelEditor : MonoBehaviour
@@ -21,7 +20,7 @@ public class VoxelEditor : MonoBehaviour
     public bool enableRemoval = true;
 
     [Tooltip("删除后重置路径追踪累积 / DLSS 历史（清除残影）")]
-    public bool resetAccumulation = true;
+    public bool resetAccumulation = false;
 
     [Tooltip("删除成功时在场景视图绘制命中体素 Gizmo（运行时可见）")]
     public bool drawHitGizmo = true;

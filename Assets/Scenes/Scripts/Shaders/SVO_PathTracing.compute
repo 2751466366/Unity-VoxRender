@@ -1220,6 +1220,14 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             // 天空像素：MV=0，深度=远平面
             _MotionVectorRT[pixel] = float2(0.0f, 0.0f);
             _DepthRT[pixel] = 1.0f;
+            // RR 引导面必须写中性值：fi 在 PathTrace 入口已初始化为
+            // normal=(0,0,1) / roughness=1 / albedo=0，跳过不写会留下无效的 0 法线，
+            // 使 RR 在天空与轮廓处的重建不稳定（静态区域游走/抖动）
+            #ifdef DLSS_RR
+            _DiffuseAlbedoRT[pixel]   = float4(fi.diffuseAlbedo, 1.0);
+            _SpecularAlbedoRT[pixel]  = float4(fi.specularAlbedo, 1.0);
+            _NormalRoughnessRT[pixel] = float4(fi.normal, fi.roughness);
+            #endif
             _PathTracingResult[pixel] = float4(color, 1.0);
             return;
         }

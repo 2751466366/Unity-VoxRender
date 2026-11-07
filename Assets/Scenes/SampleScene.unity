@@ -277,6 +277,7 @@ GameObject:
   - component: {fileID: 963194226}
   - component: {fileID: 963194229}
   - component: {fileID: 963194230}
+  - component: {fileID: 963194231}
   m_Layer: 0
   m_Name: Main Camera
   m_TagString: MainCamera
@@ -391,10 +392,28 @@ MonoBehaviour:
   svoGBuffer: {fileID: 7200000, guid: 4192a3641dddf42448b830b15e09e027, type: 3}
   svoLighting: {fileID: 7200000, guid: b83a0f5624ebe83489b10b56e20acf95, type: 3}
   svoPathTracing: {fileID: 7200000, guid: 408e275a38cb6894c88c9ebaf9b44fe1, type: 3}
-  enableVoxelEditing: 1
   maxBounceDepth: 3
   enableDLSS: 1
   dlssMode: 1
+  dlssQuality: 3
+--- !u!114 &963194231
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 963194225}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 431ac309bfbb43643ae84f276f219dd7, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  enableRemoval: 1
+  resetAccumulation: 0
+  drawHitGizmo: 1
+  verboseLogging: 1
+  enableDragBrush: 1
+  dragSampleStepPixels: 4
 --- !u!1 &1171443738
 GameObject:
   m_ObjectHideFlags: 0

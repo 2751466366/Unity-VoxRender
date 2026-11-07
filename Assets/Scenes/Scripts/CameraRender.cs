@@ -36,20 +36,24 @@ public class CameraRender : MonoBehaviour
     [Tooltip("SVO 路径追踪计算着色器（拖入 SVO_PathTracing.compute）")]
     public ComputeShader svoPathTracing;
 
-    [Header("Voxel Editing")]
-    [Tooltip("启用体素编辑：启动时自动挂载 VoxelEditor（左键点击删除体素），已存在则不重复添加")]
-    public bool enableVoxelEditing = true;
-
     [Header("Path Tracing")]
     [Range(1, 16)] public int maxBounceDepth = 4;
 
     [Header("DLSS")]
-    [Tooltip("启用 DLSS 降噪（DLAA 模式，100% 渲染分辨率）；插件不可用时自动回退时域累积")]
+    [Tooltip("启用 DLSS 降噪（RR/SR 均可按档位超分）；插件不可用时自动回退时域累积")]
     public bool enableDLSS = true;
         [Tooltip("Auto = 优先 RR（不可用自动降级 SR）；RayReconstruction；SuperResolution")]
         public DLSSMode dlssMode = DLSSMode.Auto;
     
+        [Tooltip("超分档位：DLAA=100% 内部渲染分辨率仅降噪；Performance≈50%；" +
+                 "实际渲染分辨率由 DLSS_GetOptimalSettings 查询，非固定比例；" +
+                 "UltraQuality 在部分驱动/模型（含 DLSSD）不受支持，会自动降一档")]
+        public DLSSQualityMode dlssQuality = DLSSQualityMode.DLAA;
+
         public enum DLSSMode { Auto, RayReconstruction, SuperResolution }
+
+        /// <summary>DLSS 质量档位（对应 NVSDK_NGX_PerfQuality_Value）。</summary>
+        public enum DLSSQualityMode { DLAA, UltraQuality, Quality, Balanced, Performance, UltraPerformance }
 
     public enum DebugView
     {
@@ -86,6 +90,17 @@ public class CameraRender : MonoBehaviour
     private readonly IntPtr[] dlssEvalBufs = new IntPtr[2]; // 双缓冲交替
     private int dlssEvalBufIdx = 0;
     private int  dlssActiveMode = DLSSInterop.ModeSR; // 实际模式（CREATE 前由 ResolveDLSSMode 解析）
+    private int  dlssRenderWidth  = 0;                // 内部渲染分辨率（档位决定，0 = 未解析）
+    private int  dlssRenderHeight = 0;
+    private int  dlssCreatedQuality = int.MinValue;   // 当前 feature 创建时的档位（变化 → 重建）
+    private int  dlssCreatedOutW = 0;                 // 当前 feature 创建时的输出分辨率
+    private int  dlssCreatedOutH = 0;
+    private bool dlssOptimalFailLogged = false;       // GetOptimalSettings 失败只提示一次
+    private int  dlssResolvedQuality = int.MinValue;  // 实际生效档位（驱动不支持请求档位时降档）
+    private int  dlssResolvedForRequested = int.MinValue; // 上述结果的缓存键：请求档位
+    private int  dlssResolvedForOutW = 0;             // 上述结果的缓存键：输出宽
+    private int  dlssResolvedForOutH = 0;             // 上述结果的缓存键：输出高
+    private int  dlssDegradeLoggedQuality = int.MinValue; // 已提示过的降档结果（避免刷屏）
     private readonly IntPtr[] dlssMatrixBufs = new IntPtr[2]; // RR 矩阵双缓冲（每块 32 float：W2V+V2C）
     private int dlssMatrixBufIdx = 0;
     private RenderTexture diffuseAlbedoRT;    // RR GBuffer: ARGBHalf
@@ -126,13 +141,6 @@ public class CameraRender : MonoBehaviour
         // 组件重新启用时允许 DLSS 重新初始化（OnDisable 已发 Shutdown）
         dlssInitAttempted = false;
         dlssFailedLogged = false;
-
-        // 体素编辑：自动挂载，免去手动 Add Component（Play 模式生效）
-        if (enableVoxelEditing && GetComponent<VoxelEditor>() == null)
-        {
-            gameObject.AddComponent<VoxelEditor>();
-            Debug.Log("[CameraRender] 已自动挂载 VoxelEditor — Play 后左键点击即可删除体素");
-        }
     }
 
     void OnDisable()
@@ -424,26 +432,37 @@ public class CameraRender : MonoBehaviour
             return;
         }
 
-        // 创建或重建 RT
+        // ---- DLSS 状态机推进（INIT → CREATE → READY，失败自动回退时域累积）----
+        // 必须先推进：档位决定的内部渲染分辨率决定 PT RT 尺寸
+        AdvanceDLSSState(w, h);
+
+        bool dlssReady = enableDLSS && dlssState == DLSSInterop.StateFeatureReady;
+        bool useRR = dlssReady && dlssActiveMode == DLSSInterop.ModeRR;
+        bool useSR = dlssReady && dlssActiveMode == DLSSInterop.ModeSR;
+        bool useDLSS = useRR || useSR;
+
+        // DLSS 路径按档位内部渲染分辨率调度；回退路径保持全分辨率
+        int renderW = (useDLSS && dlssRenderWidth  > 0) ? dlssRenderWidth  : w;
+        int renderH = (useDLSS && dlssRenderHeight > 0) ? dlssRenderHeight : h;
+
+        // 创建或重建 PT RT（尺寸 = 内部渲染分辨率）
         bool resolutionChanged = false;
-        if (pathTracingRT == null || pathTracingRT.width != w || pathTracingRT.height != h)
+        if (pathTracingRT == null || pathTracingRT.width != renderW || pathTracingRT.height != renderH)
         {
             resolutionChanged = true;
             if (pathTracingRT != null) { pathTracingRT.Release(); Destroy(pathTracingRT); }
-            pathTracingRT = new RenderTexture(w, h, 0, RenderTextureFormat.ARGBFloat);
+            pathTracingRT = new RenderTexture(renderW, renderH, 0, RenderTextureFormat.ARGBFloat);
             pathTracingRT.enableRandomWrite = true;
             pathTracingRT.name = "PathTracing_RT";
             pathTracingRT.Create();
         }
 
-        // ---- DLSS 状态机推进（INIT → CREATE → READY，失败自动回退时域累积）----
-        AdvanceDLSSState(w, h, resolutionChanged);
-        bool dlssReady = enableDLSS && dlssState == DLSSInterop.StateFeatureReady
-                         && pathTracingRT.GetNativeTexturePtr() != IntPtr.Zero;
-        bool useRR = dlssReady && dlssActiveMode == DLSSInterop.ModeRR;
-        bool useSR = dlssReady && dlssActiveMode == DLSSInterop.ModeSR;
-        bool useDLSS = useRR || useSR;
-        if (useDLSS) EnsureDLSSRTs(w, h);
+        if (useDLSS && pathTracingRT.GetNativeTexturePtr() == IntPtr.Zero)
+        {
+            // 极端兜底：RT 未就绪 → 本帧跳过 evaluate（渲染尺寸仍为内部尺寸）
+            useRR = useSR = useDLSS = false;
+        }
+        if (useDLSS) EnsureDLSSRTs(renderW, renderH, w, h);
 
         // 检测方向光
         Vector3 sunDir = Vector3.up;
@@ -486,8 +505,8 @@ public class CameraRender : MonoBehaviour
             int phase = haltonIndex % 8 + 1;
             jx = Halton(phase, 2) - 0.5f;
             jy = Halton(phase, 3) - 0.5f;
-            projMatrix.m02 += 2f * jx / w;   // 像素空间 jitter → NDC（z 斜率列）
-            projMatrix.m12 += 2f * jy / h;
+            projMatrix.m02 += 2f * jx / renderW;   // 像素空间 jitter → NDC（内部渲染分辨率）
+            projMatrix.m12 += 2f * jy / renderH;
         }
         haltonIndex++;
 
@@ -547,12 +566,14 @@ public class CameraRender : MonoBehaviour
 
             uint tgX, tgY, tgZ;
             svoPathTracing.GetKernelThreadGroupSizes(kernel, out tgX, out tgY, out tgZ);
-            svoPathTracing.Dispatch(kernel, Mathf.CeilToInt(w / (float)tgX), Mathf.CeilToInt(h / (float)tgY), 1);
+            svoPathTracing.Dispatch(kernel, Mathf.CeilToInt(renderW / (float)tgX), Mathf.CeilToInt(renderH / (float)tgY), 1);
 
             pathTracingFrameCount++;
 
             // ---- DLSS evaluate（渲染线程执行，严格位于 dispatch 之后）----
-            if (useDLSS) IssueDLSSEvaluate(w, h, jx, jy, viewToClip);
+            // RR 的 W2V/V2C 必须不含抖动（NGX 约定 "All matrices should NOT contain temporal AA jitter offset"）：
+            // 抖动已由 InJitterOffset 单独传入，若把抖动烘进 V2C，RR 内部反投影会逐帧错位 → 静态区域抖动
+            if (useDLSS) IssueDLSSEvaluate(renderW, renderH, jx, jy, GL.GetGPUProjectionMatrix(currentProj, false));
 
             prevJitteredVP = vp;
         }
@@ -585,8 +606,8 @@ public class CameraRender : MonoBehaviour
         catch (Exception) { return DLSSInterop.StateInitFailed; }
     }
 
-    /// <summary>推进 DLSS 状态机（INIT → CREATE → READY）。</summary>
-    void AdvanceDLSSState(int w, int h, bool resolutionChanged)
+    /// <summary>推进 DLSS 状态机（INIT → CREATE → READY）；档位/输出分辨率变化时重建 feature。</summary>
+    void AdvanceDLSSState(int outW, int outH)
     {
         if (!enableDLSS) return;
 
@@ -611,16 +632,38 @@ public class CameraRender : MonoBehaviour
             return;
         }
 
-        // 3. INIT 成功 → 解析实际模式 + 创建 feature（一次；DLAA：输入=输出=全分辨率）
-        if (dlssState == DLSSInterop.StateInitSucceeded && !dlssCreatePending)
+        // 请求档位 → 实际生效档位 + 内部渲染分辨率（仅参数变化时重查，避免每帧 P/Invoke）
+        int quality = CurrentPerfQuality();
+        bool stateUsable = dlssState == DLSSInterop.StateInitSucceeded
+                           || dlssState == DLSSInterop.StateFeatureReady;
+        if (stateUsable &&
+            (quality != dlssResolvedForRequested || outW != dlssResolvedForOutW || outH != dlssResolvedForOutH))
+            UpdateInternalResolution(outW, outH);
+
+        bool paramsChanged = dlssResolvedQuality != dlssCreatedQuality
+                             || outW != dlssCreatedOutW || outH != dlssCreatedOutH;
+
+        // 3. INIT 成功 → 解析模式 + 内部渲染分辨率（档位）→ 创建/重建 feature
+        if (dlssState == DLSSInterop.StateInitSucceeded)
         {
             ResolveDLSSMode();
-            dlssCreatePending = true;
-            IssueDLSSCreate(w, h);
+
+            if (!dlssCreatePending || paramsChanged)
+            {
+                dlssCreatePending = true;
+                IssueDLSSCreate(outW, outH);
+            }
+            return;
         }
 
-        // 4. 分辨率变化 → 下一帧 evaluate 带 reset
-        if (resolutionChanged) dlssNeedsReset = true;
+        // 4. READY 但档位/输出分辨率变化 → 释放 feature，下一帧按新参数重建
+        if (dlssState == DLSSInterop.StateFeatureReady && paramsChanged)
+        {
+            dlssCreatePending = false;
+            dlssNeedsReset = true;
+            IssueDLSSRelease();
+            dlssState = DLSSInterop.StateInitSucceeded; // 本帧按未就绪处理，避免释放后仍 evaluate
+        }
     }
 
     void TryInitDLSS()
@@ -655,17 +698,21 @@ public class CameraRender : MonoBehaviour
         catch (Exception ex)                { dlssState = DLSSInterop.StateInitFailed; Debug.LogWarning("[DLSS] 初始化异常: " + ex.Message); }
     }
 
-    void IssueDLSSCreate(int w, int h)
+    void IssueDLSSCreate(int outW, int outH)
     {
+        // 用"实际生效档位"：UpdateInternalResolution 已按驱动支持情况降档
+        //（如 DLSSD 明确拒绝 UltraQuality，若照原样 CREATE 会失败 → 整体回退时域累积）
+        int perfQuality = dlssResolvedQuality != int.MinValue ? dlssResolvedQuality : CurrentPerfQuality();
         try
         {
             var create = new DLSSInterop.CreateData
             {
-                inputWidth   = (uint)w,
-                inputHeight  = (uint)h,
-                outputWidth  = (uint)w,   // DLAA：1:1，仅降噪 + AA
-                outputHeight = (uint)h,
-                perfQuality  = DLSSInterop.QualityDLAA,
+                // 输入 = 档位内部渲染分辨率；输出 = 屏幕分辨率（RR/SR 均支持任意档位）
+                inputWidth   = (uint)Mathf.Max(dlssRenderWidth, 1),
+                inputHeight  = (uint)Mathf.Max(dlssRenderHeight, 1),
+                outputWidth  = (uint)outW,
+                outputHeight = (uint)outH,
+                perfQuality  = perfQuality,
                 featureFlags = DLSSInterop.FlagIsHDR | DLSSInterop.FlagMVJittered,
                 mode          = dlssActiveMode,
                 roughnessMode = DLSSInterop.RoughnessPacked, // roughness 存 normals.w
@@ -677,12 +724,23 @@ public class CameraRender : MonoBehaviour
             DLSSInterop.IssuePluginEvent(cb, DLSSInterop.EventCreateFeature, dlssCreateDataPtr);
             Graphics.ExecuteCommandBuffer(cb);
             cb.Dispose();
+
+            dlssCreatedQuality = perfQuality;
+            dlssCreatedOutW = outW;
+            dlssCreatedOutH = outH;
             dlssNeedsReset = true; // 创建后首帧丢弃历史
         }
-        catch (Exception ex) { Debug.LogWarning("[DLSS] CreateFeature 异常: " + ex.Message); }
+        catch (Exception ex)
+        {
+            Debug.LogWarning("[DLSS] CreateFeature 异常: " + ex.Message);
+            // 记录尝试参数，避免异常后每帧重试刷屏（档位/分辨率再变时会重试）
+            dlssCreatedQuality = perfQuality;
+            dlssCreatedOutW = outW;
+            dlssCreatedOutH = outH;
+        }
     }
 
-    void IssueDLSSEvaluate(int w, int h, float jx, float jy, Matrix4x4 viewToClip)
+    void IssueDLSSEvaluate(int renderW, int renderH, float jx, float jy, Matrix4x4 viewToClipNoJitter)
     {
         // RR 矩阵：双缓冲交替写入持久块（渲染线程异步消费 float*，不能指向短命内存）
         IntPtr w2vPtr = IntPtr.Zero, v2cPtr = IntPtr.Zero;
@@ -693,7 +751,7 @@ public class CameraRender : MonoBehaviour
                 dlssMatrixBufs[midx] = Marshal.AllocHGlobal(32 * sizeof(float));
             float[] m = new float[32];
             FlattenMatrix(cam.worldToCameraMatrix, m, 0);   // WorldToView
-            FlattenMatrix(viewToClip, m, 16);               // ViewToClip（含 jitter）
+            FlattenMatrix(viewToClipNoJitter, m, 16);       // ViewToClip（不含 jitter：jitter 由 InJitterOffset 单独传入）
             Marshal.Copy(m, 0, dlssMatrixBufs[midx], 32);
             dlssMatrixBufIdx = midx;
             w2vPtr = dlssMatrixBufs[midx];
@@ -710,8 +768,8 @@ public class CameraRender : MonoBehaviour
             jitterY       = -jy,
             mvScaleX      = 1f,  // shader 已输出像素单位 MV
             mvScaleY      = 1f,
-            subrectWidth  = (uint)w,
-            subrectHeight = (uint)h,
+            subrectWidth  = (uint)renderW,   // 内部渲染尺寸（NGX 由此推导 render resolution）
+            subrectHeight = (uint)renderH,
             reset         = dlssNeedsReset ? 1 : 0,
             // ---- RR 专用（SR 模式置空，插件侧忽略）----
             diffuseAlbedo  = (dlssActiveMode == DLSSInterop.ModeRR && diffuseAlbedoRT != null)  ? diffuseAlbedoRT.GetNativeTexturePtr()  : IntPtr.Zero,
@@ -738,13 +796,15 @@ public class CameraRender : MonoBehaviour
         cb.Dispose();
     }
 
-    /// <summary>确保 DLSS 附加 RT（MV/深度/输出）与屏幕分辨率一致。</summary>
-    void EnsureDLSSRTs(int w, int h)
+    /// <summary>确保 DLSS 附加 RT（MV/深度按内部渲染分辨率，输出按屏幕分辨率）。</summary>
+    void EnsureDLSSRTs(int renderW, int renderH, int outW, int outH)
     {
         bool rrRTsReady = dlssActiveMode != DLSSInterop.ModeRR ||
-                          (diffuseAlbedoRT != null && diffuseAlbedoRT.width == w && diffuseAlbedoRT.height == h);
-        if (motionVectorRT != null && motionVectorRT.width == w && motionVectorRT.height == h &&
-            depthRT != null && dlssOutputRT != null && rrRTsReady)
+                          (diffuseAlbedoRT != null && diffuseAlbedoRT.width == renderW && diffuseAlbedoRT.height == renderH);
+        if (motionVectorRT != null && motionVectorRT.width == renderW && motionVectorRT.height == renderH &&
+            depthRT != null && depthRT.width == renderW && depthRT.height == renderH &&
+            dlssOutputRT != null && dlssOutputRT.width == outW && dlssOutputRT.height == outH &&
+            rrRTsReady)
             return;
 
         ReleaseRT(ref motionVectorRT);
@@ -752,19 +812,19 @@ public class CameraRender : MonoBehaviour
         ReleaseRT(ref dlssOutputRT);
 
         // RGFloat(R32G32F)与 shader 的 RWTexture2D<float2> UAV 格式精确匹配
-        motionVectorRT = new RenderTexture(w, h, 0, RenderTextureFormat.RGFloat);
+        motionVectorRT = new RenderTexture(renderW, renderH, 0, RenderTextureFormat.RGFloat);
         motionVectorRT.name = "DLSS_MotionVectors";
         motionVectorRT.filterMode = FilterMode.Point;
         motionVectorRT.enableRandomWrite = true;
         motionVectorRT.Create();
 
-        depthRT = new RenderTexture(w, h, 0, RenderTextureFormat.RFloat);
+        depthRT = new RenderTexture(renderW, renderH, 0, RenderTextureFormat.RFloat);
         depthRT.name = "DLSS_Depth";
         depthRT.filterMode = FilterMode.Point;
         depthRT.enableRandomWrite = true;
         depthRT.Create();
 
-        dlssOutputRT = new RenderTexture(w, h, 0, RenderTextureFormat.ARGBFloat);
+        dlssOutputRT = new RenderTexture(outW, outH, 0, RenderTextureFormat.ARGBFloat);
         dlssOutputRT.name = "DLSS_Output";
         dlssOutputRT.filterMode = FilterMode.Point;
         dlssOutputRT.enableRandomWrite = true;
@@ -774,15 +834,15 @@ public class CameraRender : MonoBehaviour
 
         // RR GBuffer 三张（惰性创建，SR 模式不占显存）
         if (dlssActiveMode == DLSSInterop.ModeRR &&
-            (diffuseAlbedoRT == null || diffuseAlbedoRT.width != w || diffuseAlbedoRT.height != h))
+            (diffuseAlbedoRT == null || diffuseAlbedoRT.width != renderW || diffuseAlbedoRT.height != renderH))
         {
             ReleaseRT(ref diffuseAlbedoRT);
             ReleaseRT(ref specularAlbedoRT);
             ReleaseRT(ref normalRoughnessRT);
 
-            diffuseAlbedoRT   = CreateDLSSRT(w, h, "DLSS_DiffuseAlbedo",  RenderTextureFormat.ARGBHalf);
-            specularAlbedoRT  = CreateDLSSRT(w, h, "DLSS_SpecularAlbedo", RenderTextureFormat.ARGBHalf);
-            normalRoughnessRT = CreateDLSSRT(w, h, "DLSS_NormalRoughness", RenderTextureFormat.ARGBHalf);
+            diffuseAlbedoRT   = CreateDLSSRT(renderW, renderH, "DLSS_DiffuseAlbedo",  RenderTextureFormat.ARGBHalf);
+            specularAlbedoRT  = CreateDLSSRT(renderW, renderH, "DLSS_SpecularAlbedo", RenderTextureFormat.ARGBHalf);
+            normalRoughnessRT = CreateDLSSRT(renderW, renderH, "DLSS_NormalRoughness", RenderTextureFormat.ARGBHalf);
         }
     }
 
@@ -821,6 +881,116 @@ public class CameraRender : MonoBehaviour
         dlssActiveMode = want;
     }
 
+    /// <summary>UI 档位 → NVSDK_NGX_PerfQuality_Value。</summary>
+    int CurrentPerfQuality()
+    {
+        switch (dlssQuality)
+        {
+            case DLSSQualityMode.DLAA:             return DLSSInterop.QualityDLAA;
+            case DLSSQualityMode.UltraQuality:     return DLSSInterop.QualityUltraQuality;
+            case DLSSQualityMode.Quality:          return DLSSInterop.QualityMaxQuality;
+            case DLSSQualityMode.Balanced:         return DLSSInterop.QualityBalanced;
+            case DLSSQualityMode.Performance:      return DLSSInterop.QualityMaxPerf;
+            case DLSSQualityMode.UltraPerformance: return DLSSInterop.QualityUltraPerf;
+            default:                               return DLSSInterop.QualityDLAA;
+        }
+    }
+
+    /// <summary>
+    /// 查询档位对应的内部渲染分辨率（NGX optimal settings）。
+    /// 驱动/模型可能不支持某些档位：DLSSD 对 UltraQuality 的 optimal 返回 0x0 且 CREATE 报
+    /// "unsupported by this version of DLSSD" → 必须沿降级链换成受支持档位，否则整体回退时域累积。
+    /// </summary>
+    void UpdateInternalResolution(int outW, int outH)
+    {
+        int requested = CurrentPerfQuality();
+        int q = requested;
+        int rw = 0, rh = 0, rc = -1;
+        bool resolved = false;
+
+        for (int i = 0; i < 8; i++)
+        {
+            rw = rh = 0;
+            try { rc = DLSSInterop.DLSS_GetOptimalSettings(outW, outH, q, out rw, out rh); }
+            catch (Exception) { rc = -1; }
+
+            if (rc == 0 && rw > 0 && rh > 0 && rw <= outW && rh <= outH) { resolved = true; break; }
+            if (rc != 0) break;                        // 能力参数不可用 → 无法判断档位，直接全分辨率
+
+            int next = NextLowerQuality(q);
+            if (next == q) break;                      // 已到 DLAA 仍无效
+            q = next;
+        }
+
+        dlssResolvedQuality      = resolved ? q : requested;
+        dlssResolvedForRequested = requested;
+        dlssResolvedForOutW      = outW;
+        dlssResolvedForOutH      = outH;
+
+        int newW = resolved ? rw : outW;
+        int newH = resolved ? rh : outH;
+
+        if (resolved && q != requested && q != dlssDegradeLoggedQuality)
+        {
+            dlssDegradeLoggedQuality = q;
+            Debug.LogWarning($"[DLSS] 当前驱动/模型不支持档位 {QualityName(requested)}（optimal 尺寸无效）" +
+                             $" → 自动降为 {QualityName(q)}");
+        }
+        if (!resolved && !dlssOptimalFailLogged)
+        {
+            dlssOptimalFailLogged = true;
+            Debug.LogWarning($"[DLSS] GetOptimalSettings 失败(rc={rc}) → 回退全分辨率渲染");
+        }
+
+        if (newW != dlssRenderWidth || newH != dlssRenderHeight)
+        {
+            dlssRenderWidth  = newW;
+            dlssRenderHeight = newH;
+            Debug.Log($"[DLSS] 档位 {QualityName(dlssResolvedQuality)}: 输出 {outW}x{outH} → 内部渲染 {newW}x{newH}");
+        }
+    }
+
+    /// <summary>档位降级链：请求档位不受支持时按此顺序回退（DLAA 为终点）。</summary>
+    static int NextLowerQuality(int q)
+    {
+        switch (q)
+        {
+            case DLSSInterop.QualityUltraQuality: return DLSSInterop.QualityMaxQuality;
+            case DLSSInterop.QualityMaxQuality:   return DLSSInterop.QualityBalanced;
+            case DLSSInterop.QualityBalanced:     return DLSSInterop.QualityMaxPerf;
+            case DLSSInterop.QualityMaxPerf:      return DLSSInterop.QualityUltraPerf;
+            case DLSSInterop.QualityUltraPerf:    return DLSSInterop.QualityDLAA;
+            default:                              return q;
+        }
+    }
+
+    static string QualityName(int q)
+    {
+        switch (q)
+        {
+            case DLSSInterop.QualityDLAA:         return "DLAA";
+            case DLSSInterop.QualityUltraQuality: return "UltraQuality";
+            case DLSSInterop.QualityMaxQuality:   return "Quality";
+            case DLSSInterop.QualityBalanced:     return "Balanced";
+            case DLSSInterop.QualityMaxPerf:      return "Performance";
+            case DLSSInterop.QualityUltraPerf:    return "UltraPerformance";
+            default:                              return $"Quality({q})";
+        }
+    }
+
+    /// <summary>释放当前 feature（档位/分辨率变化重建用）；下一帧状态回到 INIT_SUCCEEDED。</summary>
+    void IssueDLSSRelease()
+    {
+        try
+        {
+            var cb = new CommandBuffer { name = "DLSS ReleaseFeature" };
+            DLSSInterop.IssuePluginEvent(cb, DLSSInterop.EventReleaseFeature, IntPtr.Zero);
+            Graphics.ExecuteCommandBuffer(cb);
+            cb.Dispose();
+        }
+        catch (Exception ex) { Debug.LogWarning("[DLSS] ReleaseFeature 异常: " + ex.Message); }
+    }
+
     void ReleaseDLSS()
     {
         if (dlssInitAttempted)
@@ -851,6 +1021,15 @@ public class CameraRender : MonoBehaviour
         dlssState = DLSSInterop.StateNotInitialized;
         dlssCreatePending = false;
         dlssNeedsReset = false;
+        dlssRenderWidth = 0;
+        dlssRenderHeight = 0;
+        dlssCreatedQuality = int.MinValue;
+        dlssCreatedOutW = 0;
+        dlssCreatedOutH = 0;
+        dlssResolvedQuality = int.MinValue;
+        dlssResolvedForRequested = int.MinValue;
+        dlssResolvedForOutW = 0;
+        dlssResolvedForOutH = 0;
     }
 
     static void FreeHGlobalRef(ref IntPtr p)
