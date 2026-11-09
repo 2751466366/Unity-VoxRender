@@ -17,7 +17,7 @@ public class VoxelEditor : MonoBehaviour
 {
     [Header("Voxel Removal")]
     [Tooltip("启用左键删除体素")]
-    public bool enableRemoval = true;
+    public bool enableRemoval = false;
 
     [Tooltip("删除后重置路径追踪累积 / DLSS 历史（清除残影）")]
     public bool resetAccumulation = false;

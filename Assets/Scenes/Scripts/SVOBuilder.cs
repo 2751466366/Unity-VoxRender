@@ -8,8 +8,9 @@ using UnityEngine;
 ///
 /// 构建流程:
 ///   Phase 1: Scene Bounds → gridOrigin / rootSide / depth + 合并全局 materialElements
-///   Phase 2: Top-down Insert → 逐体素递归插入节点池
+///   Phase 2: Morton 排序 + 自底向上归并 → 紧凑子槽节点池（P0-4 方案 A）
 ///   Phase 3: GPU Upload → ComputeBuffer.SetData + Shader.SetGlobal*
+///   Phase 4: 自发光体素 NEE 光源表
 /// </summary>
 public static class SVOBuilder
 {
@@ -20,16 +21,18 @@ public static class SVOBuilder
     private static ComputeBuffer sAliasBuf;
 
     // ---- CPU 侧镜像（拾取/删除用，与 GPU buffer 同步维护）----
-    private static List<SVONode>     sPool;         // 节点池副本
+    private static List<SVONode>     sPool;         // 节点池副本（紧凑子槽布局）
     private static Vector3Int        sRootMinInt;   // 根最小角（scene-space 整数）
     private static Vector3           sRootMinWorld; // 根最小角（世界空间 = rootMin * scale）
     private static int               sDepth;        // 八叉树深度
     private static float             sScale;        // 体素缩放
-    private static Dictionary<Vector3Int, int> sVoxelMap; // gridCoord → voxelElements 索引
+    // gridCoord → voxelElements 索引：改为“按 Morton 排序的活跃索引数组 + 二分查找”，
+    // 替代原先 2201 万项的 Dictionary<Vector3Int,int>（约 528~620MB、构建 2~5s）
+    private static int[]             sSortedVoxelIdx;
+    private static int               sActiveVoxelCount;
     private static HashSet<int> sEmissiveSet;              // 发光体素的 voxelElements 索引（重建光源表 O(E) 用）
 
     // ---- 运行时复用缓冲（拖刷高频调用，消除临时分配/GC）----
-    private static readonly List<int>  sParentIdxs = new List<int>(16);  // RemoveVoxelAt 父链
     private static readonly SVONode[]  sSingleNode = new SVONode[1];     // UploadNode 单节点上传
 
     /// <summary>SVO 树遍历栈项（CPU 拾取用，与 GPU TraverseSVO_Stack 同构）。</summary>
@@ -47,7 +50,7 @@ public static class SVOBuilder
     private const int TravStackCap = 256; // 栈容量上限（每层最多4子×深度≤16，远够）
 
     /// <summary>SVO 已构建且 CPU 镜像可用（拾取/删除的前置条件）。</summary>
-    public static bool IsReady => sPool != null && sVoxelMap != null && sNodeBuf != null;
+    public static bool IsReady => sPool != null && sPool.Count > 0 && sSortedVoxelIdx != null && sNodeBuf != null;
 
     /// <summary>grid 坐标 → 世界坐标（与 shader 的 grid*_SVOScale+_SVORootMin 一致）。</summary>
     public static Vector3 GridToWorld(Vector3Int gridCoord) => (Vector3)(gridCoord + sRootMinInt) * sScale;
@@ -64,7 +67,8 @@ public static class SVOBuilder
         if (sAliasBuf    != null) { sAliasBuf.Release();    sAliasBuf = null; }
 
         sPool = null;
-        sVoxelMap = null;
+        sSortedVoxelIdx = null;
+        sActiveVoxelCount = 0;
         if (sEmissiveSet != null) sEmissiveSet.Clear();
         sRootMinInt = Vector3Int.zero;
         sRootMinWorld = Vector3.zero;
@@ -116,7 +120,8 @@ public static class SVOBuilder
         {
             Debug.LogWarning("[SVOBuilder] 所有体素均已被删除（墓碑），跳过构建");
             sPool = null;      // 清 CPU 镜像，Raycast/RemoveVoxelAt 走“未就绪”分支
-            sVoxelMap = null;
+            sSortedVoxelIdx = null;
+            sActiveVoxelCount = 0;
             return;
         }
 
@@ -125,62 +130,32 @@ public static class SVOBuilder
         int maxExtent = Mathf.Max(extent.x, Mathf.Max(extent.y, extent.z));
         int depth = 1;
         while ((1 << depth) < maxExtent) depth++;
-        int rootSide = 1 << depth;
+        if (depth > 21)
+        {
+            // 64 位 Morton 每轴仅 21 位：超过则强制截断（同时告知 SVOMortonBuilder，保持 CPU/GPU 一致）
+            Debug.LogWarning($"[SVOBuilder] 场景范围过大（maxExtent={maxExtent}），depth 由 {depth} 截断为 21，超范围体素将被丢弃");
+            depth = 21;
+        }
         Vector3Int rootMin = gridOrigin;
 
         // ========================
-        // Phase 2: Top-down Insert
+        // Phase 2: Morton 排序 + 自底向上归并（P0-4 方案 A）
         // ========================
-        var pool = new List<SVONode>();
-        pool.Add(new SVONode()); // pool[0] = 根节点
+        // 先释放旧 buffer / CPU 镜像，避免新旧节点池同时驻留导致峰值翻倍
+        Release();
 
-        // gridCoord → voxelElements 索引（CPU DDA 拾取查询用；
-        // 重复坐标后写覆盖，与 Insert 叶子覆盖语义一致）
-        var voxelMap = new Dictionary<Vector3Int, int>(provider.voxelElements.Count);
-
-        int leafCount = 0;
-        int duplicateCount = 0;
-        
-        for (int i = 0; i < provider.voxelElements.Count; i++)
+        var built = SVOMortonBuilder.Build(provider.voxelElements, rootMin, depth);
+        if (built.activeCount == 0 || built.nodes.Count == 0)
         {
-            var v = provider.voxelElements[i];
-            if (v.materialIndex < 0) continue; // 墓碑：已删除体素不参与重建（自然压缩）
-            Vector3Int coord = v.worldPos - rootMin; // VoxelToGrid: 一次整数减法
-            
-            // 检查坐标是否在有效范围内
-            if (coord.x < 0 || coord.x >= rootSide ||
-                coord.y < 0 || coord.y >= rootSide ||
-                coord.z < 0 || coord.z >= rootSide)
-            {
-                duplicateCount++;
-                continue;
-            }
-
-            // 重复坐标：旧条目打墓碑，保证一格只有一条活跃条目
-            // （O(1) 删除快路径依赖此不变量：哈希索引即该格唯一活跃条目）
-            if (voxelMap.TryGetValue(coord, out int prevIdx))
-            {
-                var prev = provider.voxelElements[prevIdx];
-                if (prev.materialIndex >= 0)
-                {
-                    prev.materialIndex = -1;
-                    provider.voxelElements[prevIdx] = prev;
-                }
-                duplicateCount++;
-            }
-            
-            Insert(pool, 0, coord, v.materialIndex, depth, Vector3Int.zero);  // 根节点在 grid 空间从 (0,0,0) 开始
-            voxelMap[coord] = i;
-            leafCount++;
+            Debug.LogWarning("[SVOBuilder] Morton 构建得到空树（全部体素被过滤/删除）");
+            return;
         }
 
         // ========================
         // Phase 3: GPU Upload
         // ========================
-        Release(); // 释放旧 buffer
-
-        sNodeBuf = new ComputeBuffer(pool.Count, 16);
-        sNodeBuf.SetData(pool);
+        sNodeBuf = new ComputeBuffer(built.nodes.Count, 16);
+        sNodeBuf.SetData(built.nodes);
 
         sMatBuf = new ComputeBuffer(provider.materialElements.Count, 48);
         sMatBuf.SetData(provider.materialElements);
@@ -191,28 +166,30 @@ public static class SVOBuilder
         Shader.SetGlobalFloat ("_SVOScale",     scale);
         Shader.SetGlobalInt   ("_SVODepth",     depth);
 
-
         // 保存 CPU 侧镜像（Raycast / RemoveVoxelAt 用）
-        sPool         = pool;
-        sRootMinInt   = rootMin;
-        sRootMinWorld = (Vector3)rootMin * scale;
-        sDepth        = depth;
-        sScale        = scale;
-        sVoxelMap     = voxelMap;
+        sPool             = built.nodes;
+        sSortedVoxelIdx   = built.sortedVoxelIdx;
+        sActiveVoxelCount = built.activeCount;
+        sRootMinInt       = rootMin;
+        sRootMinWorld     = (Vector3)rootMin * scale;
+        sDepth            = depth;
+        sScale            = scale;
+
+        Debug.Log($"[SVOBuilder] 节点池={built.nodes.Count}（紧凑子槽；旧实现稠密 8 槽约 " +
+                  $"{8 * (built.nodes.Count - built.activeCount)}），活跃体素={built.activeCount}，" +
+                  $"同坐标覆盖={built.duplicateCount}，越界={built.skippedCount}，depth={depth}");
 
         // ========================
         // Phase 4: 自发光体素 NEE 光源数据
         // ========================
-        // 扫描全列表填充发光索引集合（Build 本就 O(N)，顺带完成；
-        // 运行时删除只增删集合项，重建光源表降为 O(E)）
+        // 只遍历去重后的活跃体素（O(活跃数)），不再扫全列表
         if (sEmissiveSet == null) sEmissiveSet = new HashSet<int>();
         sEmissiveSet.Clear();
-        for (int i = 0; i < provider.voxelElements.Count; i++)
+        var activeIdxArr = built.sortedVoxelIdx;
+        for (int i = 0; i < built.activeCount; i++)
         {
-            var v = provider.voxelElements[i];
-            if (v.materialIndex >= 0 && v.materialIndex < provider.materialElements.Count &&
-                Mathf.Abs(provider.materialElements[v.materialIndex].type - 3f) < 0.5f)
-                sEmissiveSet.Add(i);
+            int vi = activeIdxArr[i];
+            if (IsValidEmissive(provider, vi)) sEmissiveSet.Add(vi);
         }
         RebuildEmissiveLights(rootMin);
     }
@@ -308,42 +285,10 @@ public static class SVOBuilder
         return Mathf.Abs(provider.materialElements[v.materialIndex].type - 3f) < 0.5f;
     }
 
-    /// <summary>
-    /// 递归插入体素到八叉树节点池。
-    /// level == 0 → 叶子 (childMask=0, data=materialIndex, flags=LEAF_FLAG)
-    /// level >  0 → 内部节点 (childMask 标记子存在，data=childrenOffset)
-    /// </summary>
-    static void Insert(List<SVONode> pool, int nodeIdx, Vector3Int coord, int mat, int level, Vector3Int nodeMin)
-    {
-        if (level == 0)
-        {
-            pool[nodeIdx] = SVONode.MakeLeaf(mat);  // 设置 LEAF_FLAG
-            return;
-        }
-    
-        var n = pool[nodeIdx];
-    
-        // 如果此内部节点尚未分配子槽（非叶子且 childMask=0），分配 8 个连续空槽
-        if (!n.IsLeaf && n.childMask == 0)
-        {
-            n.data = (uint)pool.Count; // 8 槽起点
-            for (int k = 0; k < 8; k++)
-                pool.Add(SVONode.MakeEmptyInternal());  // 占位空槽
-        }
-    
-        // 根据 coord 与 nodeMin+half 比较选子象限
-        int half = 1 << (level - 1);
-        int cx = (coord.x >= nodeMin.x + half) ? 1 : 0;
-        int cy = (coord.y >= nodeMin.y + half) ? 1 : 0;
-        int cz = (coord.z >= nodeMin.z + half) ? 1 : 0;
-        int c  = cx | (cy << 1) | (cz << 2);
-
-        n.childMask |= (uint)(1 << c);
-        pool[nodeIdx] = n;
-
-        var childMin = nodeMin + new Vector3Int(cx * half, cy * half, cz * half);
-        Insert(pool, (int)n.data + c, coord, mat, level - 1, childMin);
-    }
+    // ============================================================
+    //  说明：原 Top-down Insert 递归已由 SVOMortonBuilder 替代
+    //  （Morton 排序 + 自底向上归并，只分配实际存在的子槽）。
+    // ============================================================
 
     // ============================================================
     //  运行时体素拾取 / 删除（标记删除，不重建 SVO）
@@ -412,7 +357,7 @@ public static class SVOBuilder
             {
                 hitGrid  = cur.nodeMin;
                 matIndex = (int)node.data;
-                if (sVoxelMap.TryGetValue(hitGrid, out int vi)) voxelIdx = vi;
+                voxelIdx = FindVoxelIndex(hitGrid);
                 return true;
             }
 
@@ -440,7 +385,8 @@ public static class SVOBuilder
 
                 sChildCands[childCount] = new TravItem
                 {
-                    nodeIdx = (int)node.data + i,
+                    // 紧凑子槽：第 i 个子节点 = data + popcount(childMask 的低 i 位)
+                    nodeIdx = (int)node.data + SVOMortonBuilder.Rank(node.childMask, i),
                     level   = cur.level - 1,
                     nodeMin = cur.nodeMin + new Vector3Int(cx * half, cy * half, cz * half),
                     tMin    = cTMin,
@@ -473,10 +419,11 @@ public static class SVOBuilder
 
     /// <summary>
     /// 删除指定 grid 坐标的体素（标记删除）：
-    ///   1. 走树路径定位叶子节点，覆写为空内部节点（仅 16B GPU 上传）；
-    ///   2. 向上清理子树全空的父链 childMask，避免空壳路径残留；
-    ///   3. 数据源同步：该格子所有条目（含重复坐标）打墓碑（materialIndex=-1）并移除哈希表项；
-    ///   4. 若是自发光体素，重建 NEE 光源表。
+    ///   1. 走树路径定位叶子节点（子槽偏移 = childMask 的 rank），覆写为空内部节点（16B 上传）；
+    ///   2. 数据源同步：该格子唯一活跃条目打墓碑（materialIndex=-1）；
+    ///   3. 若是自发光体素，重建 NEE 光源表。
+    /// 注意：紧凑子槽下**不能**清父节点的 childMask——rank 依赖它，清位会让后续寻址错乱；
+    /// 残留的空壳路径仅多访几个空节点，不影响正确性。
     /// 返回是否删除成功。
     /// </summary>
     public static bool RemoveVoxelAt(Vector3Int gridCoord, int voxelIdx = -1)
@@ -493,11 +440,10 @@ public static class SVOBuilder
             return false;
         }
 
-        // ---- 1. 走树路径定位叶子（记录父链供向上清理，栈复用零分配）----
+        // ---- 1. 走树路径定位叶子（紧凑子槽：childMask 的 rank 即子槽偏移）----
         int nodeIdx = 0;
         int level = sDepth;
         Vector3Int nodeMin = Vector3Int.zero;
-        sParentIdxs.Clear();
 
         while (level > 0)
         {
@@ -516,12 +462,11 @@ public static class SVOBuilder
 
             if ((node.childMask & (1u << c)) == 0u)
             {
-                Debug.LogWarning($"[SVOBuilder.RemoveVoxelAt] grid={gridCoord} 在树中无子节点（childMask 缺 bit {c}）— 树与哈希表不同步？");
+                Debug.LogWarning($"[SVOBuilder.RemoveVoxelAt] grid={gridCoord} 在树中无子节点（childMask 缺 bit {c}）— 树与索引不同步？");
                 return false;
             }
 
-            sParentIdxs.Add(nodeIdx);
-            nodeIdx = (int)node.data + c;
+            nodeIdx = (int)node.data + SVOMortonBuilder.Rank(node.childMask, c);
             nodeMin += new Vector3Int(cx * half, cy * half, cz * half);
             level--;
         }
@@ -529,7 +474,7 @@ public static class SVOBuilder
         var leaf = sPool[nodeIdx];
         if (!leaf.IsLeaf)
         {
-            Debug.LogWarning($"[SVOBuilder.RemoveVoxelAt] nodeIdx={nodeIdx} 不是叶子 — 树与哈希表不同步？");
+            Debug.LogWarning($"[SVOBuilder.RemoveVoxelAt] nodeIdx={nodeIdx} 不是叶子 — 树与索引不同步？");
             return false;
         }
         int matIndex = (int)leaf.data;
@@ -538,31 +483,10 @@ public static class SVOBuilder
         sPool[nodeIdx] = SVONode.MakeEmptyInternal();
         UploadNode(nodeIdx);
 
-        // ---- 3. 向上清理父链：子树全空的父节点清掉 childMask ----
-        for (int i = sParentIdxs.Count - 1; i >= 0; i--)
-        {
-            int parentIdx = sParentIdxs[i];
-            var parent = sPool[parentIdx];
-            if (parent.IsLeaf || parent.childMask == 0u) break;
-
-            bool allChildrenEmpty = true;
-            for (int b = 0; b < 8; b++)
-            {
-                if ((parent.childMask & (1u << b)) == 0u) continue;
-                var child = sPool[(int)parent.data + b];
-                if (child.IsLeaf || child.childMask != 0u) { allChildrenEmpty = false; break; }
-            }
-            if (!allChildrenEmpty) break;
-
-            parent.childMask = 0u;
-            sPool[parentIdx] = parent;
-            UploadNode(parentIdx);
-        }
-
-        // ---- 4. 数据源同步：墓碑标记，不移动列表元素 ----
-        // 列表结构不变 → 哈希表中其余索引永远有效。
-        // 快路径：Raycast 已返回 voxelIdx（哈希表维护的该格唯一活跃条目），O(1)；
-        // 慢路径：全列表扫描（防御/外部调用无索引时），大场景下 O(N) 仅作兑底。
+        // ---- 3. 数据源同步：墓碑标记，不移动列表元素 ----
+        // 列表结构不变 → 排序索引数组中其余条目永远有效。
+        // 快路径：Raycast 已返回 voxelIdx，O(1)；
+        // 慢路径：Morton 二分查找（外部调用无索引时），O(log N)。
         Vector3Int worldPos = gridCoord + sRootMinInt;
         int tombstoned = 0;
         bool wasEmissive = matIndex >= 0 && matIndex < provider.materialElements.Count &&
@@ -585,25 +509,51 @@ public static class SVOBuilder
         }
         else
         {
-            for (int i = 0; i < provider.voxelElements.Count; i++)
+            int found = FindVoxelIndex(gridCoord);
+            if (found >= 0)
             {
-                var e = provider.voxelElements[i];
-                if (e.materialIndex >= 0 && e.worldPos == worldPos)
+                var e = provider.voxelElements[found];
+                if (e.materialIndex >= 0)
                 {
                     e.materialIndex = -1; // 墓碑
-                    provider.voxelElements[i] = e;
+                    provider.voxelElements[found] = e;
                     tombstoned++;
-                    if (wasEmissive) sEmissiveSet.Remove(i);
+                    if (wasEmissive) sEmissiveSet.Remove(found);
                 }
             }
         }
-        sVoxelMap.Remove(gridCoord);
 
-        // ---- 5. 自发光体素被删 → 重建 NEE 光源表（O(E)，集合已同步移除）----
+        // ---- 4. 自发光体素被删 → 重建 NEE 光源表（O(E)，集合已同步移除）----
         if (wasEmissive)
             RebuildEmissiveLights(sRootMinInt);
 
         return true;
+    }
+
+    /// <summary>
+    /// grid 坐标 → voxelElements 索引（Morton 有序数组上的二分查找，替代旧 Dictionary）。
+    /// 未找到返回 -1。比较时现算 Morton（约 11 次位运算），不再额外缓存键数组。
+    /// </summary>
+    static int FindVoxelIndex(Vector3Int gridCoord)
+    {
+        if (sSortedVoxelIdx == null || sActiveVoxelCount <= 0) return -1;
+        var provider = VoxDataProvider.Instance;
+        if (provider == null) return -1;
+
+        ulong target = SVOMortonBuilder.Morton(gridCoord.x, gridCoord.y, gridCoord.z);
+        int lo = 0, hi = sActiveVoxelCount - 1;
+        while (lo <= hi)
+        {
+            int mid = (lo + hi) >> 1;
+            int vi = sSortedVoxelIdx[mid];
+            if (vi < 0 || vi >= provider.voxelElements.Count) return -1;
+            Vector3Int c = provider.voxelElements[vi].worldPos - sRootMinInt;
+            ulong k = SVOMortonBuilder.Morton(c.x, c.y, c.z);
+            if (k == target) return vi;
+            if (k < target) lo = mid + 1;
+            else hi = mid - 1;
+        }
+        return -1;
     }
 
     /// <summary>单节点覆写上传（16B，点击级开销；复用缓冲零分配）。</summary>

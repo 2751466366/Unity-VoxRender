@@ -43,6 +43,16 @@ static const float EPSILON  = 1e-6f;
 static const int   MAX_STEPS = 4096;   // 深度 10 时根对角线约 3*1024 步
 
 // ============================================================
+//  紧凑子槽寻址（与 SVOMortonBuilder 对应）：
+//  内部节点的 data 指向“按 childMask 升序紧密排列”的子槽数组，
+//  第 c 个子节点索引 = data + popcount(childMask 的低 c 位)。
+// ============================================================
+int SVORank(uint childMask, int c)
+{
+    return (int)countbits(childMask & ((1u << c) - 1u));
+}
+
+// ============================================================
 //  SVO 查找：给定网格空间整数坐标，返回叶子节点的 materialIndex
 //  从根节点递归下降，不占用栈内存
 //  返回 -1 表示该坐标处无体素
@@ -77,7 +87,7 @@ int SVOLookup(int3 gridCoord)
             return -1;
         
         // 下降到子节点
-        nodeIdx = (int)data + c;
+        nodeIdx = (int)data + SVORank(childMask, c);
         nodeMin += int3(cx * half, cy * half, cz * half);
         level--;
     }

@@ -56,3 +56,4 @@ sysinfo.txt
 *.md
 SDK/
 NativePlugins/DLSSPlugin/build/
+docs/

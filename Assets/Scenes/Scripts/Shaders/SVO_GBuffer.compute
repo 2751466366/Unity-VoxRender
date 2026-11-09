@@ -34,6 +34,16 @@ static const float EPSILON = 1e-6f;
 static const float INFINITE = 1e30f;
 
 // ============================================================
+//  紧凑子槽寻址（与 SVOMortonBuilder 对应）：
+//  内部节点的 data 指向“按 childMask 升序紧密排列”的子槽数组，
+//  第 c 个子节点索引 = data + popcount(childMask 的低 c 位)。
+// ============================================================
+int SVORank(uint childMask, int c)
+{
+    return (int)countbits(childMask & ((1u << c) - 1u));
+}
+
+// ============================================================
 //  SVO 查找：给定网格空间整数坐标，返回叶子节点的 materialIndex
 // ============================================================
 int SVOLookup(int3 gridCoord)
@@ -62,7 +72,8 @@ int SVOLookup(int3 gridCoord)
         if ((childMask & (1u << c)) == 0u)
             return -1;
 
-        nodeIdx = (int)data + c;
+        // 紧凑子槽：第 c 个子节点 = data + popcount(childMask 的低 c 位)
+        nodeIdx = (int)data + SVORank(childMask, c);
         nodeMin += int3(cx * half, cy * half, cz * half);
         level--;
     }
@@ -241,7 +252,7 @@ int TraverseSVO_Stack(float3 ro, float3 rd,
             {
                 childTMin[childCount]    = cTMin;
                 childTMax[childCount]    = cTMax;
-                childNodeIdx[childCount] = (int)data + i;
+                childNodeIdx[childCount] = (int)data + SVORank(childMask, i);
                 childLevel[childCount]   = cur.level - 1;
                 childMin[childCount]     = cur.nodeMin + int3(cx * half, cy * half, cz * half);
                 childCount++;

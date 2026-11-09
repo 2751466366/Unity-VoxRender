@@ -62,23 +62,65 @@ public class VoxDataProvider : MonoBehaviour
             return -1;
         }
 
-        IVoxFile voxFile = VoxReader.VoxReader.Read(absPath);
-        if (voxFile == null || voxFile.Models == null || voxFile.Models.Length == 0)
+        IVoxFile voxFile = null;
+
+        // parent 位置偏移（四舍五入到整数，SVO 需要整数对齐）
+        Vector3Int parentOffset = parent != null
+            ? new Vector3Int(
+                Mathf.RoundToInt(parent.position.x),
+                Mathf.RoundToInt(parent.position.y),
+                Mathf.RoundToInt(parent.position.z))
+            : Vector3Int.zero;
+
+        var asset = new VoxAsset { filePath = voxFilePath };
+
+        // ============================================================
+        // 快路径：零拷贝直接解析（P0-1 / P0-2 / P0-3）
+        // 旧 VoxReader 每解析一个 chunk 就复制“该 chunk 到 children 末尾”的全部字节，
+        // 大文件累积拷贝量可达数十 GB；且逐体素 new Voxel 对象。
+        // ============================================================
+        int matBase = materialElements.Count;
+        int voxelBase = voxelElements.Count;
+        VoxFastReader.Result fast = null;
+        try
         {
-            Debug.LogError($"[VoxDataProvider] 解析失败或无模型: {absPath}");
-            return -1;
+            fast = VoxFastReader.Read(absPath, matBase, parentOffset, voxelElements);
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogWarning($"[VoxDataProvider] 快路径异常，回退 VoxReader：{ex.Message}");
+            fast = null;
         }
 
-        var asset = new VoxAsset
+        if (fast != null)
         {
-            filePath = voxFilePath,
-            voxFile = voxFile
-        };
+            for (int i = 0; i < fast.materials.Length; i++)
+                materialElements.Add(fast.materials[i]);
 
-        if (!BuildVoxelData(voxFile, asset, parent))
+            Debug.Log($"[VoxFastReader] '{voxFilePath}'：模型={fast.modelCount}，体素={fast.voxelCount}，" +
+                      $"越界={fast.skippedVoxels}，耗时={fast.elapsedMs}ms");
+        }
+        else
         {
-            asset.Dispose();
-            return -1;
+            // ============================================================
+            // 回退路径：原 VoxReader（格式不支持 / 结构异常）
+            // ============================================================
+            RollbackTo(matBase, voxelBase);
+
+            voxFile = VoxReader.VoxReader.Read(absPath);
+            if (voxFile == null || voxFile.Models == null || voxFile.Models.Length == 0)
+            {
+                Debug.LogError($"[VoxDataProvider] 解析失败或无模型: {absPath}");
+                return -1;
+            }
+
+            asset.voxFile = voxFile;
+            if (!BuildVoxelData(voxFile, asset, parent))
+            {
+                RollbackTo(matBase, voxelBase);
+                asset.Dispose();
+                return -1;
+            }
         }
 
         int handle = -1;
@@ -97,6 +139,15 @@ public class VoxDataProvider : MonoBehaviour
         }
         Debug.Log($"[VoxDataProvider] 已加载 '{voxFilePath}'，句柄={handle}，体素={voxelElements.Count}，材质={materialElements.Count}");
         return handle;
+    }
+
+    /// <summary>回滚到本次 Load 之前的体素/材质数量（快路径失败或回退路径失败时调用）。</summary>
+    void RollbackTo(int matBase, int voxelBase)
+    {
+        if (voxelElements.Count > voxelBase)
+            voxelElements.RemoveRange(voxelBase, voxelElements.Count - voxelBase);
+        if (materialElements.Count > matBase)
+            materialElements.RemoveRange(matBase, materialElements.Count - matBase);
     }
 
     /// <summary>按句柄获取资产数据，句柄无效或已卸载返回 null。</summary>
