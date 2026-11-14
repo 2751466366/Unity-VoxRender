@@ -393,6 +393,8 @@ MonoBehaviour:
   svoLighting: {fileID: 7200000, guid: b83a0f5624ebe83489b10b56e20acf95, type: 3}
   svoPathTracing: {fileID: 7200000, guid: 408e275a38cb6894c88c9ebaf9b44fe1, type: 3}
   maxBounceDepth: 3
+  pathTracingBackend: 0
+  suppressUnitySceneRender: 1
   enableDLSS: 1
   dlssMode: 1
   dlssQuality: 3
@@ -408,7 +410,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 431ac309bfbb43643ae84f276f219dd7, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  enableRemoval: 0
+  enableRemoval: 1
   resetAccumulation: 0
   drawHitGizmo: 1
   verboseLogging: 1
@@ -511,6 +513,54 @@ MonoBehaviour:
     isActive: 0
   - filePath: Assets/Scenes/Vox/castle.vox
     isActive: 0
+--- !u!1 &1874915266
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1874915268}
+  - component: {fileID: 1874915267}
+  m_Layer: 0
+  m_Name: House
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 0
+--- !u!114 &1874915267
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1874915266}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 039da382c5b1af1478f29389f7918d5b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  voxFilePath: Assets/Scenes/Vox/japanese_voxel_house.vox
+  voxelScale: 1
+  loadOnStart: 1
+  handle: -1
+--- !u!4 &1874915268
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1874915266}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
@@ -520,3 +570,4 @@ SceneRoots:
   - {fileID: 1576022978}
   - {fileID: 629151430}
   - {fileID: 1171443740}
+  - {fileID: 1874915268}

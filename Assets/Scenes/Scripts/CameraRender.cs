@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -39,6 +41,19 @@ public class CameraRender : MonoBehaviour
     [Header("Path Tracing")]
     [Range(1, 16)] public int maxBounceDepth = 4;
 
+    [Header("Path Tracing Backend")]
+    [Tooltip("DXR：8³ 砖块 AABB + Intersection Shader 无栈 DDA（需 VoxRTPlugin.dll + voxel_pathtracing.dxil）；\n" +
+             "Compute：SVO_PathTracing.compute（原实现，冻结保留，用于 A/B 对拍与回退）；\n" +
+             "Auto：优先 DXR，不可用自动回退 Compute")]
+    public PathTracingBackend pathTracingBackend = PathTracingBackend.Auto;
+
+    [Tooltip("DXR 渲染时关闭 Unity 自身场景渲染（cullingMask=0 + 关闭相机 Skybox），省掉无用的场景 Pass；" +
+             "组件禁用或切回 Compute 时自动恢复")]
+    public bool suppressUnitySceneRender = true;
+
+    /// <summary>PathTracing 后端选择。</summary>
+    public enum PathTracingBackend { Auto, DXR, Compute }
+
     [Header("DLSS")]
     [Tooltip("启用 DLSS 降噪（RR/SR 均可按档位超分）；插件不可用时自动回退时域累积")]
     public bool enableDLSS = true;
@@ -71,6 +86,25 @@ public class CameraRender : MonoBehaviour
     private int pathTracingFrameCount = 0;
     private Matrix4x4 prevViewMatrix;
     private Matrix4x4 prevProjMatrix;
+
+    // ---- DXR 后端（VoxRTPlugin.dll）----
+    private DXRPathTracer dxr;
+    private bool dxrWarmupDone;              // 预热已完成（或已判定无需预热）
+
+    // 被原生插件引用过的 RT：延迟释放（原因见 RetireAndClear 上方注释）
+    private readonly List<RenderTexture> retiredRTs = new List<RenderTexture>();
+    private readonly List<int> retiredRTFrames = new List<int>();
+    private bool sceneRenderSuppressed;      // Unity 场景渲染当前是否被抑制
+    private int  camSavedCullingMask;
+    private CameraClearFlags camSavedClearFlags;
+    private Skybox camSkybox;
+
+    // 方向光缓存（替代每帧 FindObjectsOfType<Light>()；60 帧或 ResetAccumulation 后失效）
+    private Vector3 cachedSunDir = Vector3.up;
+    private Vector3 cachedSunColor = Vector3.zero;
+    private bool sunCacheValid;
+    private int  sunCacheAge;
+    private const int SunCacheFrames = 60;
 
     // ---- DLSS 集成状态 ----
     private bool dlssInitAttempted = false;   // INIT 仅尝试一次（失败不重试，避免拖垮帧率）
@@ -141,12 +175,27 @@ public class CameraRender : MonoBehaviour
         // 组件重新启用时允许 DLSS 重新初始化（OnDisable 已发 Shutdown）
         dlssInitAttempted = false;
         dlssFailedLogged = false;
+
+        // ---- DXR 后端：新建状态机 + 订阅体素删除事件（SVOBuilder 仅追加，无订阅者时零开销）----
+        dxr = new DXRPathTracer();
+        SVOBuilder.VoxelRemoved += OnVoxelRemoved;
+
+        // DXR 预热：不等用户切到 PathTracing 才开始推 INIT/BUILD_SCENE（那样头两帧必然回退 compute）。
+        // 纯 Compute 后端不需要预热，跳过以省掉 BLAS/TLAS 的内存与构建时间。
+        dxrWarmupDone = false;   // 新状态机 = 重新预热（每帧在 OnPreRender 里推进）
     }
 
     void OnDisable()
     {
+        // 先恢复 Unity 侧场景渲染（否则禁用后相机依旧是空场景）
+        SetUnitySceneSuppressed(false);
+
+        SVOBuilder.VoxelRemoved -= OnVoxelRemoved;
+        if (dxr != null) { dxr.Shutdown(); dxr = null; }
+
         ReleaseDLSS();
         ReleaseRTs();
+        ReleaseRetiredRTsImmediate();   // 组件已禁用，不会再有新命令引用这些 RT
         SVOBuilder.Release();
         svoBuilt = false;
 
@@ -171,6 +220,10 @@ public class CameraRender : MonoBehaviour
     {
         EnsureRTs();
         TryBuildSVO();
+        FlushRetiredRTs();
+
+        // 预热必须在渲染上下文里推进（原因见 AdvanceDXRWarmup 注释），不能放协程
+        AdvanceDXRWarmup();
 
         if (debugView == DebugView.RayTracing)
         {
@@ -202,6 +255,66 @@ public class CameraRender : MonoBehaviour
 
         SVOBuilder.Build(provider.Assets, scale);
         svoBuilt = true;
+
+        // DXR 后端：标记场景需要重建（插件未就绪/不可用时静默忽略，不影响 svoBuilt）
+        if (dxr != null) dxr.RequestSceneRebuild();
+    }
+
+    // ============================================================
+    //  DXR 预热：在进入 PathTracing 模式之前把插件推到 READY
+    //
+    //  INIT / BUILD_SCENE 都是「发事件 → 下一帧才读到结果」的异步操作，而两者都与相机
+    //  分辨率无关（RTInitData 只有 dxilPath；BUILD_SCENE 只吃体素数据）。若等用户切到
+    //  PathTracing 才开始推进，前两帧必然回退 compute → 切场景瞬间画面会跳一下。
+    //  这里提前把这两步推完，切过去时第 1 帧就是 DXR。
+    //
+    //  ⚠ 只能在 OnPreRender 里推进，不能改成协程（Update 阶段）：
+    //    插件用 IUnityGraphicsD3D12::ExecuteCommandList 提交自己的命令列表，Unity 要求它
+    //    挂在**当前帧的渲染上下文**上，并返回该列表的帧围栏值。在 Update 阶段提交
+    //    （Graphics.ExecuteCommandBuffer 在协程里）会让围栏记账错位：插件拿到的 fenceValue
+    //    无效 → 下一轮 BeginCmdList 误判槽空闲、Reset 仍在飞行的 allocator
+    //    → 延迟到 present 时才爆 DXGI_ERROR_INVALID_CALL(0x887a0001)，设备被移除。
+    //
+    //  失败（DLL 缺失 / GPU 不支持）由 DXRPathTracer 自己置 Unavailable，此后不再推进，
+    //  行为与未预热时一致：永久回退 compute。
+    //
+    //  ⚠ 必须避开 DLSS 的 feature 创建窗口（见下方 step 3 的守卫）：
+    //    NGX 的 CreateFeature 在内部一次性创建几十 MB 共享资源并往它拿到的命令列表里录命令，
+    //    实测与 DXR 的 INIT/BUILD_SCENE 命令列表撞在同一个 GPU 窗口时，会在
+    //    NVSDK_NGX_CreateFeature 内部直接触发设备移除（present 887a0005 → 887a0001）。
+    //    预热的作用是把这两步提前，而不是提前到 DLSS 初始化中间去。
+    // ============================================================
+    void AdvanceDXRWarmup()
+    {
+        if (dxrWarmupDone) return;
+        if (pathTracingBackend == PathTracingBackend.Compute) { dxrWarmupDone = true; return; }
+        if (dxr == null || dxr.IsUnavailable || cam == null) { dxrWarmupDone = true; return; }
+
+        // 1. 等 SVO 建好：SVOBuilder.VoxelWorldSize（= sScale）在那之前不是有效值，
+        //    提前 BUILD_SCENE 会用错的体素尺寸建 BLAS。
+        if (!svoBuilt) return;
+
+        // 2. 等体素数据就绪（TryBuildSVO 已保证非空，这里只兜底 provider 尚未 Awake 的情况）
+        var provider = VoxDataProvider.Instance;
+        if (provider == null || provider.voxelElements.Count == 0) return;
+
+        // 3. PathTracing 模式下给 DLSS 让路：feature 未就绪（含尚未 INIT / 正在 CREATE）时不推进。
+        //    PathTracing 分支里 AdvanceDLSSState 跑在 DispatchDXRPathTracing 之前，若预热在这里插队，
+        //    DXR 的 INIT/BUILD_SCENE 就会与 NGX CreateFeature 挤在同一帧 → 设备移除（见上方注释）。
+        //    RayTracing 模式完全不走 DLSS 分支，无需等待。
+        if (debugView == DebugView.PathTracing && enableDLSS)
+        {
+            int dlssNow = SafeGetDLSSState();
+            if (dlssNow >= 0 && dlssNow != DLSSInterop.StateFeatureReady) return;
+        }
+
+        // 4. INIT → BUILD_SCENE：每帧推进一步（状态机内部保证每步只发一次事件）
+        if (!dxr.TryInitialize(cam.pixelWidth, cam.pixelHeight)) return;
+        if (!dxr.TryBuildScene(provider.voxelElements, provider.materialElements,
+                               SVOBuilder.VoxelWorldSize)) return;
+
+        dxrWarmupDone = true;
+        Debug.Log("[CameraRender] DXR 预热完成：进入 PathTracing 时第 1 帧即走 DXR");
     }
 
     /// <summary>确保 G-Buffer RT 和 Lighting RT 与屏幕分辨率一致，变化时重建。</summary>
@@ -259,6 +372,55 @@ public class CameraRender : MonoBehaviour
         if (Application.isPlaying) Destroy(rt);
         else DestroyImmediate(rt);
         rt = null;
+    }
+
+    // ============================================================
+    //  插件引用 RT 的延迟释放
+    //
+    //  VoxRTPlugin 的 RENDER 与 DLSSPlugin 的 EVALUATE 都把 RT 的原生指针（GetNativeTexturePtr）
+    //  交给原生侧，由插件的命令列表在 GPU 上访问。Unity 的生命周期跟踪不覆盖这条路径：
+    //  一旦 C# 立刻 Release()，上一帧仍在 GPU 上执行的命令列表就会引用已释放的纹理
+    //  → present 报 887a0005，紧接着 Device removed reason 887a0001（DXGI_ERROR_INVALID_CALL）。
+    //
+    //  典型触发：DLSS 首次进入 FeatureReady 时内部渲染分辨率从全分辨率降到档位尺寸
+    //  （1920x1080 → 640x360），pathTracingRT 随之重建，而 DXR 上一帧刚往旧 RT 写过。
+    //
+    //  插件最多同时有 4 条命令列表在飞（VoxRTPlugin.CmdSlot 四槽自旋等帧围栏），这里留 2 倍余量。
+    // ============================================================
+    private const int RetiredRTFrames = 8;
+
+    /// <summary>把 RT 移入延迟释放队列并清空托管引用；当帧不做任何释放动作。</summary>
+    void RetireAndClear(ref RenderTexture rt)
+    {
+        if (rt == null) return;
+        retiredRTs.Add(rt);
+        retiredRTFrames.Add(RetiredRTFrames);
+        rt = null;
+    }
+
+    /// <summary>推进延迟释放队列：倒计时归零才真正 Release + Destroy。每帧调一次。</summary>
+    void FlushRetiredRTs()
+    {
+        for (int i = retiredRTs.Count - 1; i >= 0; i--)
+        {
+            if (--retiredRTFrames[i] > 0) continue;
+
+            var rt = retiredRTs[i];
+            retiredRTs.RemoveAt(i);
+            retiredRTFrames.RemoveAt(i);
+
+            if (rt == null) continue;
+            rt.Release();
+            if (Application.isPlaying) Destroy(rt);
+            else DestroyImmediate(rt);
+        }
+    }
+
+    /// <summary>无视倒计时立即释放队列（仅在组件禁用/销毁时需要）。</summary>
+    void ReleaseRetiredRTsImmediate()
+    {
+        for (int i = 0; i < retiredRTFrames.Count; i++) retiredRTFrames[i] = 0;
+        FlushRetiredRTs();
     }
 
     /// <summary>查找场景中第一个启用的 Directional Light，设置光照参数。</summary>
@@ -360,6 +522,13 @@ public class CameraRender : MonoBehaviour
             // DLSS 就绪时展示重建输出；否则展示时域累积结果（回退）
             RenderTexture presentRT = (dlssState == DLSSInterop.StateFeatureReady && dlssOutputRT != null)
                 ? dlssOutputRT : pathTracingRT;
+
+            // 诊断开关（cfg present=1）：强制显示 PT 原始输出，绕开 DLSS。
+            // 目的是把「黑屏」拆成两个互斥的成因：DXR 根本没写进 pathTracingRT，
+            // 还是 DXR 写了但 NGX 的重建输出（dlssOutputRT）是空的。
+            if (csPresentOverride != 0 && pathTracingRT != null)
+                presentRT = pathTracingRT;
+
             if (presentRT != null)
                 Graphics.Blit(presentRT, dest);
             else
@@ -371,6 +540,38 @@ public class CameraRender : MonoBehaviour
         }
     }
 
+    // ============================================================
+    //  运行期诊断开关（可在运行中切换，不必重编/重启）
+    //
+    //  配置：<Project>/Assets/Plugins/x86_64/voxrt_diag.cfg（与原生插件共用同一文件）
+    //      present=1  强制显示 pathTracingRT（绕开 DLSS，看 1spp 原始输出）
+    //      present=0  按 DLSS 状态自动选择（默认）
+    //
+    //  ⚠ 这里**不**读 backend：pathTracingBackend 只由 Inspector 决定。
+    //    （曾经用 cfg 的 backend= 覆写它，导致 Inspector 上手工选的 Compute
+    //      每次 Play 都被改回 Auto。）
+    // ============================================================
+    private static int csPresentOverride = 0;
+    private int csCfgTick = 0;
+
+    void ReadCsDiagCfg()
+    {
+        csPresentOverride = 0;
+        try
+        {
+            string path = Path.Combine(Application.dataPath, "Plugins/x86_64/voxrt_diag.cfg");
+            if (!File.Exists(path)) return;
+            foreach (string line in File.ReadAllLines(path))
+            {
+                string t = line.Trim();
+                if (!t.StartsWith("present=", StringComparison.Ordinal)) continue;
+                int v;
+                if (int.TryParse(t.Substring(8).Trim(), out v)) csPresentOverride = v;
+            }
+        }
+        catch (Exception) { /* 读失败按默认处理 */ }
+    }
+
     /// <summary>
     /// 重置时域累积与 DLSS 历史（体素删除等场景变化后调用，消除残影）。
     /// 时域回退路径：帧计数归零重新累积；DLSS 路径：下一帧 evaluate 带 reset 丢历史。
@@ -379,6 +580,7 @@ public class CameraRender : MonoBehaviour
     {
         pathTracingFrameCount = 0;
         dlssNeedsReset = true;
+        sunCacheAge = SunCacheFrames;   // 下一次取光照参数时强制重查（光照可能已变化）
     }
 
     /// <summary>调度 SVO GBuffer 计算着色器（Stage 1：几何阶段）。</summary>
@@ -416,20 +618,30 @@ public class CameraRender : MonoBehaviour
         }
     }
 
-    /// <summary>在 OnPreRender 中调度 SVO 路径追踪计算着色器，渲染到 pathTracingRT。</summary>
+    /// <summary>
+    /// 在 OnPreRender 中调度路径追踪，渲染到 pathTracingRT。
+    /// 后端分派：DXR 优先（Auto/DXR），任一步失败自动回退到下方的 SVO_PathTracing.compute 实现。
+    /// 共享前置（DLSS 状态机 / RT 尺寸 / jitter / 光照采集 / 累积帧计数）两后端完全一致。
+    /// </summary>
     void DispatchSVOPathTracingPre()
     {
-        if (svoPathTracing == null || cam == null) return;
+        if (cam == null) return;
 
         int w = cam.pixelWidth;
         int h = cam.pixelHeight;
         if (w <= 0 || h <= 0) return;
 
-        int kernel = svoPathTracing.FindKernel("CSMain");
-        if (kernel < 0)
+        // compute 后端需要 CSMain；DXR 后端不依赖计算着色器（未拖入 svoPathTracing 也能跑）
+        bool dxrEligible = pathTracingBackend != PathTracingBackend.Compute;
+        int kernel = (svoPathTracing != null) ? svoPathTracing.FindKernel("CSMain") : -1;
+        if (!dxrEligible)
         {
-            Debug.LogError("[PathTracing] 计算着色器找不到 CSMain kernel");
-            return;
+            if (svoPathTracing == null) return;
+            if (kernel < 0)
+            {
+                Debug.LogError("[PathTracing] 计算着色器找不到 CSMain kernel");
+                return;
+            }
         }
 
         // ---- DLSS 状态机推进（INIT → CREATE → READY，失败自动回退时域累积）----
@@ -450,7 +662,9 @@ public class CameraRender : MonoBehaviour
         if (pathTracingRT == null || pathTracingRT.width != renderW || pathTracingRT.height != renderH)
         {
             resolutionChanged = true;
-            if (pathTracingRT != null) { pathTracingRT.Release(); Destroy(pathTracingRT); }
+            // ⚠ 不能立即 Release：DXR 的 RENDER 与 NGX 的 EVALUATE 都通过原生指针跨帧引用这张 RT，
+            //   上一帧仍在 GPU 上执行的命令列表会引用已释放资源 → present 887a0005 + Device removed 887a0001
+            RetireAndClear(ref pathTracingRT);
             pathTracingRT = new RenderTexture(renderW, renderH, 0, RenderTextureFormat.ARGBFloat);
             pathTracingRT.enableRandomWrite = true;
             pathTracingRT.name = "PathTracing_RT";
@@ -463,22 +677,27 @@ public class CameraRender : MonoBehaviour
             useRR = useSR = useDLSS = false;
         }
         if (useDLSS) EnsureDLSSRTs(renderW, renderH, w, h);
-
-        // 检测方向光
-        Vector3 sunDir = Vector3.up;
-        Vector3 sunColor = Vector3.zero;
-        bool hasSun = false;
-        var lights = FindObjectsOfType<Light>();
-        foreach (var l in lights)
+        // ⚠ 引导面 RT 的原生指针必须非零：为 0 时 C++ 侧无法把它当 UAV 绑定，
+        //   旧实现会 fallback 到颜色 RT，使 RWTexture2D<float2> 绑到 RGBA32F 上。
+        //   普通 D3D12 调试层不校验 shader 级格式匹配，不报错但硬件直接 DEVICE_HUNG。
+        if (useDLSS && (motionVectorRT == null || motionVectorRT.GetNativeTexturePtr() == IntPtr.Zero ||
+                        depthRT == null || depthRT.GetNativeTexturePtr() == IntPtr.Zero))
         {
-            if (l.type == LightType.Directional && l.isActiveAndEnabled)
-            {
-                sunDir = -l.transform.forward;
-                sunColor = ((Vector4)l.color * l.intensity);
-                hasSun = true;
-                break;
-            }
+            Debug.LogWarning("[DXR] 引导面 RT 原生指针为空 → 本帧回退非 DLSS 路径");
+            useRR = useSR = useDLSS = false;
         }
+        if (useRR && (diffuseAlbedoRT == null || diffuseAlbedoRT.GetNativeTexturePtr() == IntPtr.Zero ||
+                      specularAlbedoRT == null || specularAlbedoRT.GetNativeTexturePtr() == IntPtr.Zero ||
+                      normalRoughnessRT == null || normalRoughnessRT.GetNativeTexturePtr() == IntPtr.Zero))
+        {
+            Debug.LogWarning("[DXR] RR 引导面 RT 原生指针为空 → 本帧关闭 RR 引导面写入");
+            useRR = false;
+        }
+
+        // 检测方向光（缓存：每 60 帧或被 ResetAccumulation 失效后重查，避免每帧 FindObjectsOfType）
+        Vector3 sunDir, sunColor;
+        bool hasSun;
+        GetSunParameters(out sunDir, out sunColor, out hasSun);
 
         // 检测相机是否移动（仅回退路径需要重置累积；DLSS 由 MV 自处理）
         Matrix4x4 currentView = cam.worldToCameraMatrix;
@@ -497,6 +716,10 @@ public class CameraRender : MonoBehaviour
         prevViewMatrix = currentView;
         prevProjMatrix = currentProj;
 
+        // 每 15 帧重读一次 cfg（首帧必读）
+        if (csCfgTick <= 0) ReadCsDiagCfg();
+        csCfgTick = (csCfgTick + 1) % 15;
+
         // ---- Halton(2,3) 抖动 + jittered 投影矩阵（DLSS 路径；颜色/MV/深度共用同一投影）----
         float jx = 0f, jy = 0f;
         Matrix4x4 projMatrix = cam.projectionMatrix;
@@ -509,6 +732,17 @@ public class CameraRender : MonoBehaviour
             projMatrix.m12 += 2f * jy / renderH;
         }
         haltonIndex++;
+
+        // ---- DXR 后端：共享前置已全部就绪，单条 CB 内完成 [UPDATE_VOXELS]+[RENDER]+[DLSS evaluate] ----
+        if (dxrEligible && DispatchDXRPathTracing(renderW, renderH, useDLSS, useRR,
+                jx, jy, projMatrix, currentProj, sunDir, sunColor, hasSun))
+        {
+            return;
+        }
+
+        // 走到这里 = DXR 不可用（或档位为 Compute）→ 恢复 Unity 场景渲染并回退 compute 实现
+        SetUnitySceneSuppressed(false);
+        if (svoPathTracing == null || kernel < 0) return;
 
         try
         {
@@ -581,6 +815,179 @@ public class CameraRender : MonoBehaviour
         {
             Debug.LogError($"[PathTracing] 计算着色器调度失败: {ex.Message}");
         }
+    }
+
+    // ============================================================
+    //  DXR 后端（VoxRTPlugin.dll）
+    //  原则：任何一步失败都返回 false → 调用方自动回退 compute，不抛异常不崩溃
+    // ============================================================
+
+    /// <summary>
+    /// DXR 后端单帧提交：把 [UPDATE_VOXELS] + [RENDER] + DLSS evaluate 合并到同一条 CommandBuffer。
+    /// 返回 true = 本帧已由 DXR 渲染；false = 调用方回退 compute 分支。
+    /// 参数全部来自 DispatchSVOPathTracingPre 已算好的共享前置状态（保证两后端输入逐字段一致，方便对拍）。
+    /// </summary>
+    bool DispatchDXRPathTracing(int renderW, int renderH, bool useDLSS, bool useRR,
+                                float jx, float jy, Matrix4x4 jitteredProj, Matrix4x4 plainProj,
+                                Vector3 sunDir, Vector3 sunColor, bool hasSun)
+    {
+        if (dxr == null || dxr.IsUnavailable || pathTracingRT == null) return false;
+
+        // ---- 初始化 / 场景构建状态机（各自只发一次事件，当帧返回 false 回退 compute）----
+        if (!dxr.TryInitialize(cam.pixelWidth, cam.pixelHeight)) return false;
+        var provider = VoxDataProvider.Instance;
+        if (provider == null) return false;
+        if (!dxr.TryBuildScene(provider.voxelElements, provider.materialElements, SVOBuilder.VoxelWorldSize))
+            return false;
+
+        // ---- 天空盒（与 compute 分支同一取法；cubemap 不可用时插件内部回退程序化天空）----
+        Vector3 skyColor = new Vector3(1.5f, 2.0f, 3.0f); // HDR 回退天空色，与 compute 分支保持一致
+        Cubemap skyCubemap = null;
+        var skybox = cam.GetComponent<Skybox>();
+        if (skybox != null && skybox.material != null && skybox.material.HasProperty("_Tex"))
+            skyCubemap = skybox.material.GetTexture("_Tex") as Cubemap;
+        if (skyCubemap == null && RenderSettings.skybox != null && RenderSettings.skybox.HasProperty("_Tex"))
+            skyCubemap = RenderSettings.skybox.GetTexture("_Tex") as Cubemap;
+
+        Matrix4x4 viewToClip = GL.GetGPUProjectionMatrix(jitteredProj, false);
+        Matrix4x4 vp = viewToClip * cam.worldToCameraMatrix;
+
+        var p = new DXRPathTracer.RenderParams
+        {
+            width = renderW,
+            height = renderH,
+            maxDepth = maxBounceDepth,
+            frameIndex = pathTracingFrameCount,
+            reset = pathTracingFrameCount == 0,
+            // SR/RR 都需要 MV + 深度；RR 额外写三张引导面
+            guideMask = (useDLSS ? DXRInterop.GuideMotionDepth : 0) | (useRR ? DXRInterop.GuideRR : 0),
+            invVP = vp.inverse,
+            curVP = vp,
+            prevVP = prevJitteredVP,
+            cameraPos = cam.transform.position,
+            sunDir = sunDir,
+            sunColor = sunColor,
+            hasSun = hasSun,
+            skyColor = skyColor,
+            skyCubemap = skyCubemap,
+            colorRT = pathTracingRT,
+            mvRT = useDLSS ? motionVectorRT : null,
+            depthRT = useDLSS ? depthRT : null,
+            diffuseAlbedoRT = useRR ? diffuseAlbedoRT : null,
+            specularAlbedoRT = useRR ? specularAlbedoRT : null,
+            normalRoughnessRT = useRR ? normalRoughnessRT : null,
+            jitterX = jx,
+            jitterY = jy,
+        };
+
+        var cb = new CommandBuffer { name = "VoxRT PathTracing" };
+        bool submitted;
+        try
+        {
+            submitted = dxr.SubmitRender(cb, p);
+        }
+        catch (Exception ex)
+        {
+            cb.Dispose();
+            Debug.LogWarning("[DXRPathTracer] SubmitRender 异常: " + ex.Message);
+            return false;
+        }
+
+        if (!submitted)
+        {
+            cb.Dispose();
+            return false;
+        }
+
+        // ---- DLSS evaluate：严格追加在同一 CB 内、DXR 之后 ----
+        // RR 的 W2V/V2C 必须不含抖动（抖动由 InJitterOffset 单独传入），与 compute 分支同约定
+        if (useDLSS)
+            IssueDLSSEvaluate(renderW, renderH, jx, jy, GL.GetGPUProjectionMatrix(plainProj, false), cb);
+
+        Graphics.ExecuteCommandBuffer(cb);
+        cb.Dispose();
+
+        SetUnitySceneSuppressed(true);
+
+        pathTracingFrameCount++;
+        prevJitteredVP = vp;
+        return true;
+    }
+
+    /// <summary>
+    /// 方向光参数：指向光源的方向 + 颜色×强度（与原先 FindObjectsOfType 的结果语义一致）。
+    /// 缓存 <see cref="SunCacheFrames"/> 帧；ResetAccumulation 会把缓存立刻置为过期。
+    /// </summary>
+    void GetSunParameters(out Vector3 dir, out Vector3 color, out bool has)
+    {
+        if (sunCacheValid && sunCacheAge < SunCacheFrames)
+        {
+            sunCacheAge++;
+        }
+        else
+        {
+            sunCacheValid = false;
+            sunCacheAge = 0;
+            var lights = FindObjectsOfType<Light>();
+            foreach (var l in lights)
+            {
+                if (l.type == LightType.Directional && l.isActiveAndEnabled)
+                {
+                    cachedSunDir = -l.transform.forward;          // 指向光源
+                    cachedSunColor = (Vector4)l.color * l.intensity;
+                    sunCacheValid = true;
+                    break;
+                }
+            }
+        }
+        dir = cachedSunDir;
+        color = cachedSunColor;
+        has = sunCacheValid;
+    }
+
+    /// <summary>
+    /// DXR 渲染时抑制 Unity 自身的场景渲染（cullingMask=0 + 关闭相机 Skybox）。
+    /// 幂等；suppressUnitySceneRender 关闭时永不抑制。只在 DXR 真正接管画面后才生效，
+    /// 避免 compute 回退路径因 gBufferAlbedo 失效而黑屏。
+    /// </summary>
+    void SetUnitySceneSuppressed(bool suppress)
+    {
+        if (!suppressUnitySceneRender) suppress = false;
+        if (sceneRenderSuppressed == suppress) return;
+        sceneRenderSuppressed = suppress;
+
+        if (cam == null) return;
+
+        if (suppress)
+        {
+            if (camSkybox == null) camSkybox = cam.GetComponent<Skybox>();
+            camSavedCullingMask = cam.cullingMask;
+            camSavedClearFlags = cam.clearFlags;
+            cam.cullingMask = 0;
+            cam.clearFlags = CameraClearFlags.SolidColor;
+            if (camSkybox != null) camSkybox.enabled = false;
+        }
+        else
+        {
+            cam.cullingMask = camSavedCullingMask;
+            cam.clearFlags = camSavedClearFlags;
+            if (camSkybox != null) camSkybox.enabled = true;
+        }
+    }
+
+    /// <summary>
+    /// 体素删除通知（供 VoxelEditor 等外部显式调用；SVOBuilder 内部已通过静态事件自动转发）。
+    /// scenePos 为场景空间绝对整数体素坐标（= VoxelElement.worldPos）；matIndex &lt; 0 = 删除。
+    /// </summary>
+    public void NotifyVoxelRemoved(Vector3Int scenePos, int matIndex = -1)
+    {
+        if (dxr != null) dxr.NotifyVoxelRemoved(scenePos, matIndex);
+    }
+
+    /// <summary>SVOBuilder 体素删除事件转发（只累积增量，下一帧随 UPDATE_VOXELS 一次性发出）。</summary>
+    void OnVoxelRemoved(Vector3Int scenePos, int matIndex)
+    {
+        if (dxr != null) dxr.NotifyVoxelRemoved(scenePos, matIndex);
     }
 
     // ============================================================
@@ -720,6 +1127,10 @@ public class CameraRender : MonoBehaviour
             if (dlssCreateDataPtr == IntPtr.Zero) dlssCreateDataPtr = DLSSInterop.AllocStruct(ref create);
             else DLSSInterop.WriteStruct(dlssCreateDataPtr, ref create);
 
+            // 诊断：CreateFeature 是 NGX 里最重的一步（一次性建几十 MB 共享资源），崩溃排查需要它的时机
+            Debug.Log($"[DLSS] 发起 CreateFeature：{create.inputWidth}x{create.inputHeight} → " +
+                      $"{create.outputWidth}x{create.outputHeight}，模式={(dlssActiveMode == DLSSInterop.ModeRR ? "RR" : "SR")}");
+
             var cb = new CommandBuffer { name = "DLSS CreateFeature" };
             DLSSInterop.IssuePluginEvent(cb, DLSSInterop.EventCreateFeature, dlssCreateDataPtr);
             Graphics.ExecuteCommandBuffer(cb);
@@ -740,7 +1151,8 @@ public class CameraRender : MonoBehaviour
         }
     }
 
-    void IssueDLSSEvaluate(int renderW, int renderH, float jx, float jy, Matrix4x4 viewToClipNoJitter)
+    void IssueDLSSEvaluate(int renderW, int renderH, float jx, float jy, Matrix4x4 viewToClipNoJitter,
+                           CommandBuffer externalCb = null)
     {
         // RR 矩阵：双缓冲交替写入持久块（渲染线程异步消费 float*，不能指向短命内存）
         IntPtr w2vPtr = IntPtr.Zero, v2cPtr = IntPtr.Zero;
@@ -790,6 +1202,13 @@ public class CameraRender : MonoBehaviour
             DLSSInterop.WriteStruct(dlssEvalBufs[idx], ref eval);
         dlssEvalBufIdx = idx;
 
+        // externalCb != null：调用方把事件并入自己那条 CB（DXR 路径要求 DXR 与 evaluate 同 CB 严格保序）
+        if (externalCb != null)
+        {
+            DLSSInterop.IssuePluginEvent(externalCb, DLSSInterop.EventEvaluate, dlssEvalBufs[dlssEvalBufIdx]);
+            return;
+        }
+
         var cb = new CommandBuffer { name = "DLSS Evaluate" };
         DLSSInterop.IssuePluginEvent(cb, DLSSInterop.EventEvaluate, dlssEvalBufs[dlssEvalBufIdx]);
         Graphics.ExecuteCommandBuffer(cb);
@@ -807,9 +1226,10 @@ public class CameraRender : MonoBehaviour
             rrRTsReady)
             return;
 
-        ReleaseRT(ref motionVectorRT);
-        ReleaseRT(ref depthRT);
-        ReleaseRT(ref dlssOutputRT);
+        // 这三张同样被 NGX 跨帧引用 → 延迟释放
+        RetireAndClear(ref motionVectorRT);
+        RetireAndClear(ref depthRT);
+        RetireAndClear(ref dlssOutputRT);
 
         // RGFloat(R32G32F)与 shader 的 RWTexture2D<float2> UAV 格式精确匹配
         motionVectorRT = new RenderTexture(renderW, renderH, 0, RenderTextureFormat.RGFloat);
@@ -836,9 +1256,9 @@ public class CameraRender : MonoBehaviour
         if (dlssActiveMode == DLSSInterop.ModeRR &&
             (diffuseAlbedoRT == null || diffuseAlbedoRT.width != renderW || diffuseAlbedoRT.height != renderH))
         {
-            ReleaseRT(ref diffuseAlbedoRT);
-            ReleaseRT(ref specularAlbedoRT);
-            ReleaseRT(ref normalRoughnessRT);
+            RetireAndClear(ref diffuseAlbedoRT);
+            RetireAndClear(ref specularAlbedoRT);
+            RetireAndClear(ref normalRoughnessRT);
 
             diffuseAlbedoRT   = CreateDLSSRT(renderW, renderH, "DLSS_DiffuseAlbedo",  RenderTextureFormat.ARGBHalf);
             specularAlbedoRT  = CreateDLSSRT(renderW, renderH, "DLSS_SpecularAlbedo", RenderTextureFormat.ARGBHalf);

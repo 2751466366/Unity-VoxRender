@@ -58,6 +58,13 @@ public static class SVOBuilder
     /// <summary>单个体素的世界空间尺寸（= _SVOScale）。</summary>
     public static float VoxelWorldSize => sScale;
 
+    /// <summary>
+    /// 体素删除成功通知（DXR 后端增量更新砖掩码用，避免一次编辑触发整场 BLAS 重建）。
+    /// 参数：(场景空间绝对整数体素坐标 = gridCoord + sRootMinInt，删除后该格材质索引 -1)。
+    /// 纯追加：不改变 RemoveVoxelAt 的任何既有语义；无订阅者时零开销。
+    /// </summary>
+    public static event System.Action<Vector3Int, int> VoxelRemoved;
+
     /// <summary>释放上一次 Build 创建的 ComputeBuffer 与 CPU 镜像。</summary>
     public static void Release()
     {
@@ -526,6 +533,15 @@ public static class SVOBuilder
         // ---- 4. 自发光体素被删 → 重建 NEE 光源表（O(E)，集合已同步移除）----
         if (wasEmissive)
             RebuildEmissiveLights(sRootMinInt);
+
+        // ---- 5. 通知外部（worldPos 为场景空间绝对坐标，与 VoxelElement.worldPos 同源）----
+        // 订阅方（CameraRender → DXRPathTracer）只累积增量，下一帧随 UPDATE_VOXELS 一次性发出。
+        var onRemoved = VoxelRemoved;
+        if (onRemoved != null)
+        {
+            try { onRemoved(worldPos, -1); }
+            catch (System.Exception ex) { Debug.LogWarning($"[SVOBuilder] VoxelRemoved 订阅方异常: {ex.Message}"); }
+        }
 
         return true;
     }
